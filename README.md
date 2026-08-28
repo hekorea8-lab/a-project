@@ -1,0 +1,57 @@
+# AI 회계·세무 리스크 사전검증 PoC
+
+현재 구현 범위는 SAP 거래 분석 전 단계인 외부 기준 데이터 지식 기반입니다.
+
+- 국가법령정보 Open API에서 법인세법·부가가치세법·조세특례제한법과 각 시행령·시행규칙을 수동 갱신합니다.
+- 관련 판례를 API로 검색해 수집합니다.
+- `ifrs/` 폴더의 현재 시행 K-IFRS·일반기업회계기준 PDF 전체를 기준체계 태그와 함께 색인합니다.
+- 읽기 전용 MCP 서버가 색인된 기준 데이터를 검색하고 원문 근거를 반환합니다.
+
+## 준비
+
+프로젝트별 가상환경을 만들고 필요한 라이브러리를 설치합니다.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python -m pip install -r requirements.txt
+```
+
+`.env.example`을 복사해 `.env`를 만들고, API 키는 `.env`에만 저장합니다. 실제 키는 채팅, 코드, `prd.md`에 적지 않습니다.
+
+```powershell
+Copy-Item .env.example .env
+# .env 파일에 LAW_API_OC=발급받은_국가법령정보_API_인증값 형태로 입력
+```
+
+## 실행
+
+아래 명령은 사용자가 원할 때만 실행합니다. 갱신은 법령·시행령·시행규칙·판례를 함께 처리합니다.
+
+```powershell
+python -m knowledge_base.cli refresh-law
+python -m knowledge_base.cli index-ifrs
+python -m knowledge_base.cli search "특수관계자 거래"
+python -m knowledge_base.mcp_server
+```
+
+기본 데이터베이스 위치는 `data/knowledge.db`이며 Git에서 제외됩니다. `.venv/`, `.env`, `.env.*`, `data/`는 Git에서 제외됩니다. `refresh-law`은 `LAW_API_OC`가 없으면 실행을 중단합니다.
+
+테스트 등에서 다른 데이터베이스를 MCP 서버에 연결하려면 현재 세션에서만 `KNOWLEDGE_DB_PATH`를 설정합니다.
+
+```powershell
+$env:KNOWLEDGE_DB_PATH = "data/knowledge.db"
+```
+
+## MCP 도구
+
+`knowledge_base.mcp_server`는 표준 입력/출력 기반의 읽기 전용 MCP 서버입니다.
+
+- `search_knowledge`: 키워드로 법령·판례·K-IFRS를 검색합니다.
+- `get_document`: 검색 결과의 문서 ID로 원문과 메타데이터를 조회합니다.
+
+검색 결과에는 원천, 문서 유형, 기준체계, 출처 URL, 시행일, 수집일, 버전이 포함됩니다. K-IFRS와 일반기업회계기준에 속하지 않는 PDF는 현재 PoC 검색 범위에서 제외됩니다. API 키는 MCP 응답에 포함되지 않습니다.
+
+## 제한
+
+- 예규·해석사례의 공식 수집 원천은 아직 확정되지 않아 자동 수집하지 않습니다.
+- 법적 적용 여부는 자동으로 판단하지 않으며, 담당자 검토를 전제로 합니다.

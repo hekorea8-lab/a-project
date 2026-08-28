@@ -1,0 +1,2 @@
+pypdf==6.16.2
+python-dotenv==1.2.3
