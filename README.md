@@ -28,13 +28,33 @@ Copy-Item .env.example .env
 아래 명령은 사용자가 원할 때만 실행합니다. 갱신은 법령·시행령·시행규칙·판례를 함께 처리합니다.
 
 ```powershell
-python -m knowledge_base.cli refresh-law
-python -m knowledge_base.cli index-ifrs
-python -m knowledge_base.cli search "특수관계자 거래"
-python -m knowledge_base.mcp_server
+.\.venv\Scripts\python.exe app.py refresh-law
+.\.venv\Scripts\python.exe app.py index-ifrs
+.\.venv\Scripts\python.exe app.py search "특수관계자 거래"
+.\.venv\Scripts\python.exe app.py mcp
 ```
 
 기본 데이터베이스 위치는 `data/knowledge.db`이며 Git에서 제외됩니다. `.venv/`, `.env`, `.env.*`, `data/`는 Git에서 제외됩니다. `refresh-law`은 `LAW_API_OC`가 없으면 실행을 중단합니다.
+
+## 화면·백엔드 실행
+
+Streamlit 화면과 FastAPI 백엔드는 분리돼 있으며, 화면은 HTTP API만 호출합니다.
+
+```powershell
+# 터미널 1: FastAPI 백엔드
+.\.venv\Scripts\uvicorn.exe backend.main:app --reload
+
+# 터미널 2: Streamlit 화면
+.\.venv\Scripts\streamlit.exe run frontend/streamlit_app.py
+```
+
+PostgreSQL은 `.env`의 `POSTGRES_HOST`, `POSTGRES_DATABASE`, `POSTGRES_USER`, `POSTGRES_PASSWORD`를 모두 입력한 경우에만 연결을 시도합니다. 현재 단계에서는 DB를 생성하거나 SAP 거래 데이터를 저장하지 않습니다.
+
+## OpenAI 근거 기반 검토
+
+AI 검토 API는 지정 모델 `gpt-5.6-terra`를 사용합니다. `.env`에 `OPENAI_API_KEY`를 직접 입력한 경우에만 실제 호출을 수행합니다. 키는 코드·화면·로그·보고서에 표시하지 않습니다.
+
+`POST /ai-review`는 거래 사실과 승인된 근거 문서를 받아 잠정 검토 결과를 반환합니다. AI 응답은 근거 문서 ID를 포함해야 하며, 제공되지 않은 문서 ID를 인용한 경우 별도로 표시합니다.
 
 테스트 등에서 다른 데이터베이스를 MCP 서버에 연결하려면 현재 세션에서만 `KNOWLEDGE_DB_PATH`를 설정합니다.
 
@@ -44,7 +64,7 @@ $env:KNOWLEDGE_DB_PATH = "data/knowledge.db"
 
 ## MCP 도구
 
-`knowledge_base.mcp_server`는 표준 입력/출력 기반의 읽기 전용 MCP 서버입니다.
+`app.py mcp`는 표준 입력/출력 기반의 읽기 전용 MCP 서버입니다.
 
 - `search_knowledge`: 키워드로 법령·판례·K-IFRS를 검색합니다.
 - `get_document`: 검색 결과의 문서 ID로 원문과 메타데이터를 조회합니다.
