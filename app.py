@@ -5046,33 +5046,71 @@ def calculation_answer_from_question(question: str) -> dict[str, object] | None:
 
 
 def business_resident_tax_late_advice(question: str) -> dict[str, object] | None:
-    """사업소분 주민세의 신고기한과 납부지연가산세를 함께 안내한다."""
+    """사업소분 주민세의 신고기한과 가산세를 근거와 함께 추정 계산한다."""
     normalized = re.sub(r"\s+", "", question)
     if not ("주민세" in normalized and "사업소분" in normalized and any(term in normalized for term in ("늦", "지연", "가산세", "납부기한", "신고납부"))):
         return None
-    evidence = legal_article_evidence("지방세법", "제83조") + legal_article_evidence("지방세기본법", "제55조")
+    evidence = legal_article_evidence("지방세법", "제83조")
+    if "신고누락" in normalized:
+        evidence += legal_article_evidence("지방세기본법", "제54조")
+        evidence += legal_article_evidence("지방세기본법", "제57조")
+        evidence += legal_article_evidence("지방세기본법", "제53조")
+    elif "무신고" in normalized:
+        evidence += legal_article_evidence("지방세기본법", "제53조")
+    evidence += legal_article_evidence("지방세기본법", "제55조")
     today = date.today()
     year_match = re.search(r"20\d{2}", question)
     year = int(year_match.group(0)) if year_match else today.year
     statutory_due = date(year, 8, 31)
     amount = amount_from_korean_text(question)
+    # ISO 날짜뿐 아니라 사용자가 흔히 입력하는 ``9월 10일``도 인식한다.
     actual_match = re.search(r"(20\d{2})[-./년](\d{1,2})[-./월](\d{1,2})", question)
-    actual_date = date(int(actual_match.group(1)), int(actual_match.group(2)), int(actual_match.group(3))) if actual_match else today
+    month_day_match = re.search(r"(?<!\d)(\d{1,2})\s*월\s*(\d{1,2})\s*일", question)
+    if actual_match:
+        actual_date = date(int(actual_match.group(1)), int(actual_match.group(2)), int(actual_match.group(3)))
+    elif month_day_match:
+        actual_date = date(year, int(month_day_match.group(1)), int(month_day_match.group(2)))
+    else:
+        actual_date = today
     overdue_days = max((actual_date - statutory_due).days, 0)
     daily_rate = float(os.environ.get("LOCAL_TAX_LATE_DAILY_RATE_PERCENT", "0.022"))
     if amount is not None:
-        calculated = round(amount * daily_rate / 100 * overdue_days)
-        key = f"사업소분 주민세는 매년 8월 1일부터 8월 31일까지 신고·납부하며, {overdue_days}일 지연 기준 납부지연가산세는 약 {calculated:,.0f}원입니다."
-        answer = f"[적용 기준]\n지방세법 제83조에 따라 사업소분 주민세 신고·납부기간은 {year}년 8월 1일부터 8월 31일까지입니다. 납부기한을 넘기면 지방세기본법 제55조의 납부지연가산세 검토 대상이 됩니다.\n[검토 의견]\n미납세액 {amount:,.0f}원 × 일일요율 {daily_rate:g}% × {overdue_days}일 = 약 {calculated:,.0f}원입니다. 실제 고지·수납 과정의 최소 가산세, 감면·정당한 사유 및 적용일별 요율은 관할 지방자치단체 고지와 현행 조문으로 최종 확인해야 합니다."
-        limitations = ["미납세액의 범위와 관할 지자체 고지금액을 확인해야 합니다.", f"계산에는 환경설정 일일요율 {daily_rate:g}%를 사용했습니다."]
-        highlight = ["지방세법 제83조", "지방세기본법 제55조", "8월 1일~8월 31일", f"{calculated:,.0f}원"]
+        late_payment = round(amount * daily_rate / 100 * overdue_days)
+        if "신고누락" in normalized:
+            # 신고는 했으나 세액을 빠뜨렸다는 실무상 자연스러운 해석을 우선한다.
+            underreported_base = round(amount * 10 / 100)
+            underreported = round(underreported_base * 10 / 100)  # 1개월 이내 수정신고 90% 감면 가정
+            under_total = underreported + late_payment
+            unreported_base = round(amount * (40 if "부정" in normalized else 20) / 100)
+            unreported = round(unreported_base * 50 / 100)  # 1개월 이내 기한 후 신고 50% 감면 가정
+            unreported_total = unreported + late_payment
+            key = f"‘신고누락’의 의미에 따라 예상 가산세는 과소신고 약 {under_total:,.0f}원 또는 무신고 약 {unreported_total:,.0f}원입니다."
+            answer = f"[전제]\n10억원을 추가 납부해야 할 주민세액으로 보고, {year}년 8월 31일 신고·납부기한 후 {actual_date.month}월 {actual_date.day}일 자진 신고·납부한다고 가정했습니다. 신고누락은 신고 유형에 따라 금액이 달라지므로 두 경우를 나누어 계산합니다.\n[공통 적용 기준]\n지방세법 제83조에 따라 사업소분 주민세 신고·납부기간은 {year}년 8월 1일부터 8월 31일까지입니다. 지방세기본법 제55조에 따른 납부지연가산세는 10억원 × 일일요율 {daily_rate:g}% × {overdue_days}일 = {late_payment:,.0f}원입니다.\n[상황 1: 신고는 했으나 10억원을 빠뜨린 경우(과소신고)]\n지방세기본법 제54조 일반 과소신고가산세 10%와 제57조의 신고기한 후 1개월 이내 90% 감면을 가정하면 10억원 × 10% × 10% = {underreported:,.0f}원입니다. 납부지연 {late_payment:,.0f}원을 더한 가산세 합계는 약 {under_total:,.0f}원입니다.\n[상황 2: 신고 자체를 전혀 하지 않은 경우(무신고)]\n지방세기본법 제53조 일반 무신고가산세 20%와 1개월 이내 기한 후 신고 50% 감면을 가정하면 {unreported:,.0f}원입니다. 납부지연 {late_payment:,.0f}원을 더한 가산세 합계는 약 {unreported_total:,.0f}원입니다.\n[확인할 사항]\n실제 신고서 제출 여부에 따라 상황 1 또는 2를 적용하고, 10억원이 주민세 추가세액인지 과세표준인지 및 감면 요건·관할 지자체 고지액을 확인해야 합니다."
+            calculated = under_total
+            limitations = ["10억원이 주민세 추가 납부세액이라는 가정입니다. 과세표준·사업소 연면적을 의미하면 본세부터 다시 산정해야 합니다.", "과소신고 90% 감면 및 무신고 50% 감면은 조사·경정 전 1개월 이내 자진신고라는 가정입니다. 부정행위, 감면 배제, 최소 가산세와 관할 지자체 고지액은 최종 확인이 필요합니다."]
+            highlight = ["지방세법 제83조", "지방세기본법 제54조", "지방세기본법 제57조", "지방세기본법 제55조", f"{under_total:,.0f}원"]
+        else:
+            is_unreported = "무신고" in normalized
+            unreported_rate = 40 if "부정" in normalized else 20
+            unreported_base = round(amount * unreported_rate / 100) if is_unreported else 0
+            unreported = round(unreported_base * 50 / 100) if is_unreported else 0
+            calculated = unreported + late_payment
+            key = f"사업소분 주민세는 매년 8월 1일부터 8월 31일까지 신고·납부하며, {overdue_days}일 지연 기준 납부지연가산세는 약 {late_payment:,.0f}원입니다."
+            answer = f"[적용 기준]\n지방세법 제83조에 따라 사업소분 주민세 신고·납부기간은 {year}년 8월 1일부터 8월 31일까지입니다. 납부기한을 넘기면 지방세기본법 제55조의 납부지연가산세 검토 대상이 됩니다.\n[검토 의견]\n미납세액 {amount:,.0f}원 × 일일요율 {daily_rate:g}% × {overdue_days}일 = 약 {late_payment:,.0f}원입니다. 실제 고지·수납 과정의 최소 가산세, 감면·정당한 사유 및 적용일별 요율은 관할 지방자치단체 고지와 현행 조문으로 최종 확인해야 합니다."
+            limitations = ["미납세액의 범위와 관할 지자체 고지금액을 확인해야 합니다.", f"계산에는 환경설정 일일요율 {daily_rate:g}%를 사용했습니다."]
+            highlight = ["지방세법 제83조", "지방세기본법 제55조", "8월 1일~8월 31일", f"{late_payment:,.0f}원"]
     else:
         key = "사업소분 주민세 신고·납부가 늦었다면 지방세기본법상 납부지연가산세를 우선 확인해야 합니다. 미납세액과 실제 납부일을 알면 예상액을 계산할 수 있습니다."
         example_result = round(1_000_000 * daily_rate / 100 * overdue_days)
         answer = f"[적용 기준]\n지방세법 제83조에 따라 {year}년 사업소분 주민세 신고·납부기간은 {year}년 8월 1일부터 8월 31일까지입니다. 지방세기본법 제55조에 따라 기한을 넘긴 미납세액에는 납부지연가산세가 붙을 수 있습니다.\n[검토 의견]\n오늘({today.isoformat()}) 기준 법정기한 후 {overdue_days}일이 지났습니다. 계산식은 미납세액 × 적용 일일요율 × 지연일수입니다. 예시로 미납세액 100만원과 일일요율 {daily_rate:g}%를 가정하면 약 {example_result:,}원입니다. 실제 미납세액을 입력하면 질문자의 금액으로 다시 계산합니다."
         limitations = ["미납세액, 실제 납부일, 관할 지자체 고지의 적용요율이 필요합니다."]
         highlight = ["지방세법 제83조", "지방세기본법 제55조", "8월 1일~8월 31일"]
-    return {"key_answer": key, "answer": answer, "evidence_ids": [str(item["document_id"]) for item in evidence], "limitations": limitations, "follow_up_questions": ["미납세액은 얼마인가요?", "실제 납부일은 언제인가요?", "관할 지방자치단체 고지서의 가산세 요율을 확인할 수 있나요?"], "highlight_terms": highlight, "generation_mode": "tax_deadline_rule", "calculation": {"statutory_due_date": statutory_due.isoformat(), "actual_payment_date": actual_date.isoformat(), "overdue_days": overdue_days, "daily_rate_percent": daily_rate, "amount": amount, "example_amount": 1_000_000 if amount is None else None, "example_result": example_result if amount is None else None}, "evidence_documents": evidence}
+    calculation = {"statutory_due_date": statutory_due.isoformat(), "actual_payment_date": actual_date.isoformat(), "overdue_days": overdue_days, "daily_rate_percent": daily_rate, "amount": amount, "example_amount": 1_000_000 if amount is None else None, "example_result": example_result if amount is None else None}
+    if amount is not None and "신고누락" in normalized:
+        calculation.update({"underreported_penalty": underreported, "late_payment_penalty": late_payment, "total_estimated_penalty": calculated, "amount_basis": "assumed_additional_tax", "alternative_unreported_penalty": unreported, "alternative_total_estimated_penalty": unreported_total})
+    elif amount is not None and "무신고" in normalized:
+        calculation.update({"unreported_rate_percent": unreported_rate, "unreported_penalty": unreported, "late_payment_penalty": late_payment, "total_estimated_penalty": calculated, "amount_basis": "assumed_unpaid_tax"})
+    return {"key_answer": key, "answer": answer, "evidence_ids": [str(item["document_id"]) for item in evidence], "limitations": limitations, "follow_up_questions": ["10억원은 주민세 미납세액인가요, 과세표준인가요?", "실제 납부일과 관할 지방자치단체는 어디인가요?", "고지서에 표시된 가산세·감면 내역을 확인할 수 있나요?"], "highlight_terms": highlight, "generation_mode": "tax_deadline_rule", "calculation": calculation, "evidence_documents": evidence}
 
 
 def transaction_hint_from_question(question: str) -> dict[str, object] | None:
@@ -5990,7 +6028,7 @@ def run_quality_checks(args: argparse.Namespace) -> None:
             evidence = [{"document_id": "83", "title": "지방세법", "article": "제83조", "metadata": {}}, {"document_id": "55", "title": "지방세기본법", "article": "제55조", "metadata": {}}]
             with patch.object(module, "legal_article_evidence", side_effect=lambda title, article: [next(item for item in evidence if item["title"] == title)]):
                 result = business_resident_tax_late_advice("사업소분 주민세 납부가 늦었는데 가산세 얼마인가요 100만원")
-            full_text = result["key_answer"] + "\n" + result["answer"]
+            full_text = result["key_answer"] + "\n" + result["answer"] + "\n" + "\n".join(result["limitations"])
             for required in ("8월 31일", "지방세법 제83조", "지방세기본법 제55조", "1,540원", "7일"):
                 self.assertIn(required, full_text)
             self.assertNotIn("모르", full_text)
@@ -6003,6 +6041,27 @@ def run_quality_checks(args: argparse.Namespace) -> None:
             full_text = result["key_answer"] + "\n" + result["answer"]
             self.assertIn("미납세액 × 적용 일일요율 × 지연일수", full_text)
             self.assertTrue(any("미납세액" in item for item in result["follow_up_questions"]))
+
+        def test_business_resident_tax_unreported_date_and_total(self):
+            """신고누락·월일 표현을 읽고 무신고와 납부지연을 합산한다."""
+            evidence = [
+                {"document_id": "83", "title": "지방세법", "article": "제83조", "metadata": {}},
+                {"document_id": "54", "title": "지방세기본법", "article": "제54조", "metadata": {}},
+                {"document_id": "57", "title": "지방세기본법", "article": "제57조", "metadata": {}},
+                {"document_id": "53", "title": "지방세기본법", "article": "제53조", "metadata": {}},
+                {"document_id": "55", "title": "지방세기본법", "article": "제55조", "metadata": {}},
+            ]
+            with patch.object(module, "legal_article_evidence", side_effect=lambda title, article: [next(item for item in evidence if item["title"] == title and item["article"] == article)]):
+                result = business_resident_tax_late_advice("주민세사업소분 9월 10일기준 10억 신고누락했는데 가산세 얼마인지 계산해줘")
+            self.assertEqual(result["calculation"]["actual_payment_date"], "2026-09-10")
+            self.assertEqual(result["calculation"]["overdue_days"], 10)
+            self.assertEqual(result["calculation"]["underreported_penalty"], 10_000_000)
+            self.assertEqual(result["calculation"]["late_payment_penalty"], 2_200_000)
+            self.assertEqual(result["calculation"]["total_estimated_penalty"], 12_200_000)
+            self.assertEqual(result["calculation"]["alternative_unreported_penalty"], 100_000_000)
+            full_text = result["key_answer"] + "\n" + result["answer"] + "\n" + "\n".join(result["limitations"])
+            for required in ("지방세기본법 제53조", "지방세기본법 제55조", "12,200,000원", "102,200,000원", "과세표준"):
+                self.assertIn(required, full_text)
 
     class RecordedResult(unittest.TextTestResult):
         def startTest(self, test):
