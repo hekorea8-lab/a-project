@@ -3217,6 +3217,8 @@ class KnowledgeReportPptxRequest(BaseModel):
     answer: str = Field(default="", max_length=12_000)
     key_answer: str = Field(default="", max_length=2_000)
     limitations: list[str] = Field(default_factory=list, max_length=10)
+    follow_up_questions: list[str] = Field(default_factory=list, max_length=10)
+    calculation: dict[str, object] = Field(default_factory=dict)
     evidence: list[dict[str, object]] = Field(default_factory=list, max_length=15)
     generation_mode: str = Field(default="", max_length=80)
 
@@ -4685,10 +4687,9 @@ def web_app() -> HTMLResponse:
     )
     chat_script = chat_script.replace(
         "add('answer',body)};const submit=",
-        "const reportId='report-'+Date.now()+'-'+Math.random().toString(36).slice(2);window.__chatReports=window.__chatReports||{};window.__chatReports[reportId]={question:payload.question||'',knowledge_track:track.value,key_answer:answer.key_answer||'',answer:answer.answer||'',limitations:answer.limitations||[],evidence:used,generation_mode:answer.generation_mode||''};if(answer.generation_mode!=='verification_withheld'&&String(answer.answer||'').trim())body+='<div class=\\\"report-actions\\\"><button type=\\\"button\\\" class=\\\"ppt-report-button\\\" data-ppt-report=\\\"'+reportId+'\\\">검토의견 기반 PPT 생성</button></div>';const rendered=add('answer',body);rendered.dataset.question=payload.question||'';rendered.dataset.baseAnswer=(answer.key_answer||'')+'\\n'+(answer.answer||'')};const submit=",
+        "const reportId='report-'+Date.now()+'-'+Math.random().toString(36).slice(2);window.__chatReports=window.__chatReports||{};window.__chatReports[reportId]={question:payload.question||'',knowledge_track:track.value,key_answer:answer.key_answer||'',answer:answer.answer||'',limitations:answer.limitations||[],follow_up_questions:answer.follow_up_questions||[],calculation:answer.calculation||{},evidence:used,generation_mode:answer.generation_mode||''};if(answer.generation_mode!=='verification_withheld'&&String(answer.answer||'').trim())body+='<div class=\\\"report-actions\\\"><button type=\\\"button\\\" class=\\\"ppt-report-button\\\" data-ppt-report=\\\"'+reportId+'\\\">검토의견 기반 PPT 생성</button></div>';const rendered=add('answer',body);rendered.dataset.question=payload.question||'';rendered.dataset.baseAnswer=(answer.key_answer||'')+'\\n'+(answer.answer||'')};const submit=",
     )
     chat_script = chat_script.replace(
-        "const pptReport=async button=>{const report=window.__chatReports[button.dataset.pptReport];if(!report)return;button.disabled=true;button.textContent='PPT 생성 중…';try{const response=await fetch('/knowledge-chat/report-pptx',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(report)});if(!response.ok){const error=await response.json().catch(()=>({}));throw new Error(error.detail||'PPT를 생성하지 못했습니다.')}const blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='포스코퓨처엠_검토보고서.pptx';link.click();URL.revokeObjectURL(url);button.textContent='PPT 다운로드 완료'}catch(error){button.disabled=false;button.textContent=error.message||'PPT 생성 실패'}};chat.addEventListener('click',event=>{const button=event.target.closest('[data-ppt-report]');if(button)pptReport(button)});const globalLoader=document.createElement('div');",
         "const specialize=async button=>{const card=button.closest('.message'),question=String(card?.dataset.question||'').trim();if(!question)return;button.disabled=true;button.textContent='포스코퓨처엠 관점으로 검토 중…';try{const response=await fetch('/knowledge-chat/company-specialize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,knowledge_track:track.value,base_answer:String(card?.dataset.baseAnswer||'')})});const payload=await response.json();if(!response.ok)throw new Error(payload.detail||'회사 특화 검토를 생성하지 못했습니다.');payload.question=question;render(payload)}catch(error){button.disabled=false;button.textContent=error.message||'회사 특화 검토를 다시 시도하세요.'}};chat.addEventListener('click',event=>{const button=event.target.closest('[data-company-specialize]');if(button)specialize(button)});const globalLoader=document.createElement('div');",
     )
     # 화면 조합 과정에서 로딩 효과가 빠지면 조용히 배포하지 않고 즉시 오류로 드러낸다.
@@ -5457,6 +5458,8 @@ def knowledge_chat_report_pptx(payload: KnowledgeReportPptxRequest) -> FileRespo
         "key_answer": payload.key_answer,
         "answer": payload.answer,
         "limitations": payload.limitations,
+        "follow_up_questions": payload.follow_up_questions,
+        "calculation": payload.calculation,
         "evidence": payload.evidence,
     }, ensure_ascii=False), encoding="utf-8")
     node = os.environ.get("CODEX_NODE", r"C:\Users\POSCOFUTUREM\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe")
@@ -6088,6 +6091,7 @@ def run_quality_checks(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     cli_main()
+
 
 
 

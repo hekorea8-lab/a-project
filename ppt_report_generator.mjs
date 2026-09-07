@@ -14,6 +14,10 @@ const p = Presentation.create({ slideSize: { width: 1280, height: 720 } });
 const blue = "#0068B7", dark = "#17324D", pale = "#EAF3FA", line = "#C9D9E5";
 const clean = (value, max = 700) => String(value || "").replace(/\r/g, "").trim().slice(0, max);
 const bullets = (text) => clean(text, 1400).split(/\n+/).map(x => x.trim()).filter(Boolean).slice(0, 8);
+const reviewItems = [...(data.limitations || []), ...(data.follow_up_questions || [])].map(x => String(x).trim()).filter(Boolean).slice(0, 6);
+const recommendationText = reviewItems.length
+  ? reviewItems.map((item, index) => `○ ${index + 1}. ${clean(item, 180)}`).join("\n")
+  : "○ 검토의견에 기재된 추가 확인사항을 담당자에게 요청\n- 계약서·신고서·고지서 등 원문 자료를 기준으로 사실관계 보완";
 const titleBox = (slide, title, page) => {
   const bar = slide.shapes.add({ geometry: "rect", position: { left: 0, top: 0, width: 1280, height: 62 }, fill: blue, line: { fill: blue, width: 0 } });
   const t = slide.shapes.add({ geometry: "textbox", position: { left: 34, top: 14, width: 820, height: 36 }, fill: "none", line: { fill: "none", width: 0 } });
@@ -49,7 +53,7 @@ textBox(slide, "※ 표의 근거는 검색된 문서와 사용자 입력을 구
 
 slide = p.slides.add(); slide.background.fill = "#FFFFFF"; titleBox(slide, "## 3 검토결과", 4);
 section(slide, "결론", `○ ${clean(data.key_answer || "현재 근거 범위에서 잠정 판단을 정리합니다.", 360)}\n- 최종 회계·세무 처리는 원문과 거래 증빙을 확인한 후 판단 필요`, 105);
-section(slide, "의사결정 요청사항", "○ 사실관계 보완자료 제출 여부\n○ 관련 부서 검토 및 증빙 확보 추진\n○ 적용 기준일과 회사 거래 해당성 확인 고려", 300);
+section(slide, "의사결정 요청사항", recommendationText, 300);
 section(slide, "향후계획", "○ (즉시) 계약서·세금계산서·원가명세 등 사실관계 확인\n○ (검토 후) 적용 기준과 세무 쟁점 재검색\n○ (확정 시) 회계처리 및 세무신고 대응방안 추진", 500);
 const evidence = (data.evidence || []).map((x, i) => `[${i + 1}] ${clean(x.title, 100)}${x.article ? ` ${x.article}` : ""}`); if (evidence.length) textBox(slide, `근거 문서\n${evidence.join("\n")}`, 760, 500, 430, 130, 11, "#607489");
 
