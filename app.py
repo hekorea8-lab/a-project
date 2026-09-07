@@ -3218,6 +3218,7 @@ class KnowledgeReportPptxRequest(BaseModel):
     key_answer: str = Field(default="", max_length=2_000)
     limitations: list[str] = Field(default_factory=list, max_length=10)
     evidence: list[dict[str, object]] = Field(default_factory=list, max_length=15)
+    generation_mode: str = Field(default="", max_length=80)
 
 
 class RiskScoreRequest(BaseModel):
@@ -4653,7 +4654,7 @@ def web_app() -> HTMLResponse:
     )
     chat_script = chat_script.replace(
         "let body=answer.key_answer?'<div class=\"key\">핵심 안내<br>'+esc(answer.key_answer)+'</div>':'';",
-        "let body=answer.key_answer?'<div class=\"key\">핵심 안내<br>'+highlighted(answer.key_answer,answer.highlight_terms)+'</div>':'';",
+        "let body=answer.key_answer?'<div class=\"key\">핵심 안내<br>'+highlighted(answer.key_answer,answer.highlight_terms)+'</div>':'';if(answer.calculation){const calc=answer.calculation;body+='<section class=\"calculation-card\"><div class=\"answer-section-label\">근거 기반 추정계산</div><b>'+esc(calc.result_amount!=null?Number(calc.result_amount).toLocaleString('ko-KR')+'원':'계산에 필요한 값 확인 중')+'</b>'+(calc.formula?'<p>'+esc(calc.formula)+'</p>':'')+(calc.overdue_days!=null?'<p>지연일수 '+esc(calc.overdue_days)+'일 · 적용 일일요율 '+esc(calc.daily_rate_percent)+'%</p>':'')+'</section>'}",
     )
     chat_script = chat_script.replace(
         "body+=reviewBlocks(answer.answer);",
@@ -4684,7 +4685,7 @@ def web_app() -> HTMLResponse:
     )
     chat_script = chat_script.replace(
         "add('answer',body)};const submit=",
-        "const reportId='report-'+Date.now()+'-'+Math.random().toString(36).slice(2);window.__chatReports=window.__chatReports||{};window.__chatReports[reportId]={question:payload.question||'',knowledge_track:track.value,key_answer:answer.key_answer||'',answer:answer.answer||'',limitations:answer.limitations||[],evidence:used};body+='<div class=\\\"report-actions\\\"><button type=\\\"button\\\" class=\\\"ppt-report-button\\\" data-ppt-report=\\\"'+reportId+'\\\">포스코 양식 검토보고서 PPT 생성</button></div>';const rendered=add('answer',body);rendered.dataset.question=payload.question||'';rendered.dataset.baseAnswer=(answer.key_answer||'')+'\\n'+(answer.answer||'')};const submit=",
+        "const reportId='report-'+Date.now()+'-'+Math.random().toString(36).slice(2);window.__chatReports=window.__chatReports||{};window.__chatReports[reportId]={question:payload.question||'',knowledge_track:track.value,key_answer:answer.key_answer||'',answer:answer.answer||'',limitations:answer.limitations||[],evidence:used,generation_mode:answer.generation_mode||''};if(answer.generation_mode!=='verification_withheld'&&String(answer.answer||'').trim())body+='<div class=\\\"report-actions\\\"><button type=\\\"button\\\" class=\\\"ppt-report-button\\\" data-ppt-report=\\\"'+reportId+'\\\">검토의견 기반 PPT 생성</button></div>';const rendered=add('answer',body);rendered.dataset.question=payload.question||'';rendered.dataset.baseAnswer=(answer.key_answer||'')+'\\n'+(answer.answer||'')};const submit=",
     )
     chat_script = chat_script.replace(
         "const pptReport=async button=>{const report=window.__chatReports[button.dataset.pptReport];if(!report)return;button.disabled=true;button.textContent='PPT 생성 중…';try{const response=await fetch('/knowledge-chat/report-pptx',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(report)});if(!response.ok){const error=await response.json().catch(()=>({}));throw new Error(error.detail||'PPT를 생성하지 못했습니다.')}const blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='포스코퓨처엠_검토보고서.pptx';link.click();URL.revokeObjectURL(url);button.textContent='PPT 다운로드 완료'}catch(error){button.disabled=false;button.textContent=error.message||'PPT 생성 실패'}};chat.addEventListener('click',event=>{const button=event.target.closest('[data-ppt-report]');if(button)pptReport(button)});const globalLoader=document.createElement('div');",
@@ -4703,6 +4704,7 @@ def web_app() -> HTMLResponse:
     html = html.replace("</style>", ".global-request-loader{position:fixed;z-index:9999;top:18px;right:22px;display:flex;align-items:center;gap:9px;padding:10px 14px;background:#073e69;color:#fff;border:1px solid #4da6dc;border-radius:24px;box-shadow:0 8px 22px rgba(4,48,82,.22);font-size:13px;font-weight:800;opacity:0;transform:translateY(-12px);pointer-events:none;transition:opacity .18s,transform .18s}.global-request-loader.visible{opacity:1;transform:translateY(0)}.global-orbit{width:15px;height:15px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;animation:chat-spin .65s linear infinite}@media(max-width:760px){.global-request-loader{top:10px;right:10px}}</style>")
     html = html.replace("</style>", ".nav button[data-view=dashboard],.nav button[data-view=analysis],#dashboard,#analysis{display:none!important}</style>", 1)
     html = html.replace("</style>", ".report-actions{display:flex;justify-content:flex-end;margin-top:16px}.ppt-report-button{border:0;border-radius:7px;padding:10px 14px;background:#0a6fba;color:#fff;font:inherit;font-weight:800;cursor:pointer}.ppt-report-button:disabled{opacity:.7;cursor:wait}</style>", 1)
+    html = html.replace("</style>", ".calculation-card{margin:15px 0;padding:15px 18px;background:#f1f8ff;border:1px solid #c5dff1;border-left:5px solid #0874bd;border-radius:9px}.calculation-card b{font-size:22px;color:#075e9f}.calculation-card p{margin:7px 0 0;color:#38536b}</style>", 1)
     html = html.replace("</script></body>", "</script><script>" + chat_script + "</script></body>")
     # 인라인 이벤트가 포함된 단일 화면은 이전 HTML이 남으면 버튼 수정도 반영되지 않으므로 캐시하지 않는다.
     return HTMLResponse(html, headers={"Cache-Control": "no-store, max-age=0"})
@@ -5397,6 +5399,8 @@ def accounting_standard_source(document_id: str) -> FileResponse:
 @app.post("/knowledge-chat/report-pptx")
 def knowledge_chat_report_pptx(payload: KnowledgeReportPptxRequest) -> FileResponse:
     """현재 챗봇 답변을 포스코퓨처엠 검토보고서 PPT로 변환한다."""
+    if not payload.answer.strip() or payload.generation_mode in {"verification_withheld", ""}:
+        raise HTTPException(status_code=422, detail="AI 검토의견과 근거가 생성된 후 PPT를 만들 수 있습니다. 먼저 질문을 보완해 주세요.")
     build_dir = PROJECT_ROOT / ".ppt-build"
     output_dir = PROJECT_ROOT / "outputs" / "reports"
     build_dir.mkdir(parents=True, exist_ok=True)
