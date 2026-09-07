@@ -2,10 +2,11 @@
 
 현재 구현 범위는 SAP 거래 분석 전 단계인 외부 기준 데이터 지식 기반입니다.
 
-- 국가법령정보 Open API에서 법인세법·부가가치세법·조세특례제한법과 각 시행령·시행규칙을 수동 갱신합니다.
-- 관련 판례를 API로 검색해 수집합니다.
+- 국가법령정보 Open API에서 법인세법·부가가치세법·조세특례제한법과 지방세기본법·지방세법·지방세특례제한법·지방세징수법의 각 시행령·시행규칙을 수동 갱신합니다.
+- 국세·지방세 관계법 관련 판례를 API로 검색해 수집합니다.
 - `ifrs/` 폴더의 현재 시행 K-IFRS·일반기업회계기준 PDF 전체를 기준체계 태그와 함께 색인합니다.
 - 읽기 전용 MCP 서버가 색인된 기준 데이터를 검색하고 원문 근거를 반환합니다.
+- 선택적으로 PostgreSQL `pgvector`에 법령·판례·회계기준 원문 조각의 임베딩을 저장해 키워드와 의미 검색을 함께 사용합니다.
 
 ## 준비
 
@@ -29,12 +30,18 @@ Copy-Item .env.example .env
 
 ```powershell
 .\.venv\Scripts\python.exe app.py refresh-law
+.\.venv\Scripts\python.exe app.py refresh-laws
 .\.venv\Scripts\python.exe app.py index-ifrs
+.\.venv\Scripts\python.exe app.py index-embeddings
 .\.venv\Scripts\python.exe app.py search "특수관계자 거래"
 .\.venv\Scripts\python.exe app.py mcp
 ```
 
 기본 데이터베이스 위치는 `data/knowledge.db`이며 Git에서 제외됩니다. `.venv/`, `.env`, `.env.*`, `data/`는 Git에서 제외됩니다. `refresh-law`은 `LAW_API_OC`가 없으면 실행을 중단합니다.
+
+`refresh-laws`는 법령·시행령·시행규칙만 먼저 갱신해 검색을 빠르게 복구한다. 판례까지 포함한 전체 갱신은 `refresh-law`로 별도 실행한다.
+
+`index-embeddings`는 사용자가 직접 실행할 때만 OpenAI 임베딩 API를 호출합니다. 실행 전 PostgreSQL 서버에 `pgvector` 확장을 설치·사용할 권한과 `.env`의 `POSTGRES_*`, `OPENAI_API_KEY` 설정이 필요합니다. 설정이 없거나 벡터 검색에 실패한 경우에도 검색은 기존 키워드 방식으로 동작합니다.
 
 ## 화면·백엔드 실행
 

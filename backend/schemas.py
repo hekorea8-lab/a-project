@@ -17,7 +17,12 @@ class EvidenceDocument(BaseModel):
     source: str
     source_url: str | None = None
     effective_date_or_version: str | None = None
+    article: str | None = None
+    hierarchy_path: str | None = None
     excerpt: str
+    metadata: dict[str, object] = Field(default_factory=dict)
+    relevance: int | float | None = None
+    relation_info: dict[str, object] | None = None
 
 
 class AiReviewRequest(BaseModel):
@@ -33,6 +38,31 @@ class AutoAiReviewRequest(BaseModel):
     transaction: dict[str, str | int | float | None]
     issue_keywords: list[str] = Field(default_factory=list)
     evidence_limit: int = 10
+
+
+class KnowledgeChatHistoryTurn(BaseModel):
+    """후속 질의가 직전 논의를 이어갈 때만 쓰는 짧은 대화 문맥이다."""
+
+    question: str = Field(min_length=2, max_length=500)
+    key_answer: str = Field(min_length=1, max_length=800)
+
+
+class KnowledgeChatAttachment(BaseModel):
+    """지식 챗봇 질문의 사실관계 보강에만 사용하는 사용자 첨부자료다."""
+
+    filename: str
+    content_type: str
+    content_base64: str
+
+
+class NaturalLanguageQueryRequest(BaseModel):
+    """자연어 챗봇이 읽기 전용 내부 데이터와 근거를 함께 조회하는 요청이다."""
+
+    question: str = Field(min_length=2, max_length=1_000)
+    evidence_limit: int = Field(default=8, ge=1, le=15)
+    data_limit: int = Field(default=20, ge=1, le=50)
+    conversation: list[KnowledgeChatHistoryTurn] = Field(default_factory=list, max_length=3)
+    attachments: list[KnowledgeChatAttachment] = Field(default_factory=list, max_length=5)
 
 
 class RiskScoreRequest(BaseModel):

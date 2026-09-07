@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="980" viewBox="0 0 1600 980" role="img" aria-labelledby="title description">
+  <title id="title">회계·세무 지식 챗봇 LangGraph RAG 아키텍처</title>
+  <desc id="description">사용자 질문부터 하이브리드 검색, Evidence Pack, 회계·세무 전문가 검토와 근거 검증을 거쳐 답변에 이르는 흐름도</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#5a7188"/></marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="5" stdDeviation="5" flood-color="#27435b" flood-opacity=".14"/></filter>
+    <style>
+      .title{font:700 32px Arial,'Noto Sans KR',sans-serif;fill:#102f49}.subtitle{font:400 16px Arial,'Noto Sans KR',sans-serif;fill:#5d7182}.group{font:700 17px Arial,'Noto Sans KR',sans-serif;fill:#075f9f}.node{font:700 16px Arial,'Noto Sans KR',sans-serif;fill:#163249;text-anchor:middle}.small{font:400 13px Arial,'Noto Sans KR',sans-serif;fill:#52697c;text-anchor:middle}.label{font:700 13px Arial,'Noto Sans KR',sans-serif;fill:#546c80}.line{stroke:#5a7188;stroke-width:2.4;fill:none;marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <rect width="1600" height="980" fill="#f5f8fb"/>
+  <text x="72" y="66" class="title">회계·세무 지식 챗봇 · LangGraph RAG 설계</text>
+  <text x="72" y="95" class="subtitle">원형: 참여자 / 마름모: 조건 분기 / 사각형: 처리 노드 / 색상: 처리 계층</text>
+
+  <rect x="55" y="140" width="280" height="740" rx="18" fill="#e8f4fd" stroke="#b9dcef"/>
+  <text x="82" y="177" class="group">01 · 입력과 문맥</text>
+  <circle cx="195" cy="260" r="72" fill="#0874bd" filter="url(#shadow)"/>
+  <text x="195" y="252" font-family="Arial,'Noto Sans KR',sans-serif" font-size="19" font-weight="700" fill="#fff" text-anchor="middle">사용자</text>
+  <text x="195" y="278" font-family="Arial,'Noto Sans KR',sans-serif" font-size="14" fill="#fff" text-anchor="middle">질문 · 메일 · 캡처</text>
+  <polygon points="195,395 278,465 195,535 112,465" fill="#fff3d7" stroke="#d69a23" stroke-width="2" filter="url(#shadow)"/>
+  <text x="195" y="459" class="node">대화 유형</text><text x="195" y="482" class="small">새 질의 / 후속 질문</text>
+  <rect x="90" y="600" width="210" height="88" rx="12" fill="#fff" stroke="#78b8e0" stroke-width="2" filter="url(#shadow)"/>
+  <text x="195" y="637" class="node">사실관계 추출</text><text x="195" y="661" class="small">거래 · 금액 · 기간 · 쟁점</text>
+  <rect x="90" y="735" width="210" height="88" rx="12" fill="#fff" stroke="#78b8e0" stroke-width="2" filter="url(#shadow)"/>
+  <text x="195" y="772" class="node">문맥 결합</text><text x="195" y="796" class="small">후속 질문일 때만 적용</text>
+
+  <rect x="385" y="140" width="390" height="740" rx="18" fill="#eef9f3" stroke="#bfe2ce"/>
+  <text x="412" y="177" class="group">02 · Hybrid RAG와 그래프</text>
+  <rect x="442" y="235" width="276" height="88" rx="12" fill="#fff" stroke="#35a46e" stroke-width="2" filter="url(#shadow)"/>
+  <text x="580" y="272" class="node">Hybrid RAG 검색</text><text x="580" y="296" class="small">질문 트랙: 회계 / 세무 / 복합</text>
+  <rect x="420" y="392" width="150" height="88" rx="12" fill="#fff" stroke="#35a46e" stroke-width="2"/>
+  <text x="495" y="429" class="node">정확 검색</text><text x="495" y="452" class="small">조문 · 키워드</text>
+  <rect x="590" y="392" width="150" height="88" rx="12" fill="#fff" stroke="#35a46e" stroke-width="2"/>
+  <text x="665" y="429" class="node">벡터 검색</text><text x="665" y="452" class="small">의미 유사도</text>
+  <rect x="442" y="548" width="276" height="88" rx="12" fill="#fff" stroke="#35a46e" stroke-width="2" filter="url(#shadow)"/>
+  <text x="580" y="585" class="node">관계 그래프 확장</text><text x="580" y="609" class="small">조문 인용 · 문단 참조 · 최대 2-hop</text>
+  <rect x="442" y="704" width="276" height="88" rx="12" fill="#dff3e8" stroke="#258a59" stroke-width="2" filter="url(#shadow)"/>
+  <text x="580" y="741" class="node">Evidence Pack</text><text x="580" y="765" class="small">검증된 근거 · 관계 경로 · 거래 사실</text>
+
+  <rect x="825" y="140" width="330" height="740" rx="18" fill="#fff5e5" stroke="#f0d49d"/>
+  <text x="852" y="177" class="group">03 · 전문가 검토</text>
+  <polygon points="990,250 1080,325 990,400 900,325" fill="#fff" stroke="#d69a23" stroke-width="2" filter="url(#shadow)"/>
+  <text x="990" y="319" class="node">도메인 분기</text><text x="990" y="342" class="small">회계 / 세무 / 복합</text>
+  <rect x="870" y="465" width="240" height="92" rx="46" fill="#7047a8" filter="url(#shadow)"/>
+  <text x="990" y="502" font-family="Arial,'Noto Sans KR',sans-serif" font-size="18" font-weight="700" fill="#fff" text-anchor="middle">전문가 검토 LLM</text>
+  <text x="990" y="527" font-family="Arial,'Noto Sans KR',sans-serif" font-size="13" fill="#fff" text-anchor="middle">회계·세무 고연차 검토 관점</text>
+  <polygon points="990,635 1080,710 990,785 900,710" fill="#fff" stroke="#d69a23" stroke-width="2" filter="url(#shadow)"/>
+  <text x="990" y="704" class="node">계산형 질문?</text><text x="990" y="727" class="small">세액 · 공제 · 가산세</text>
+
+  <rect x="1205" y="140" width="340" height="740" rx="18" fill="#f4ecfb" stroke="#d7bee9"/>
+  <text x="1232" y="177" class="group">04 · 검증과 답변</text>
+  <rect x="1255" y="265" width="240" height="88" rx="12" fill="#fff" stroke="#9b69bf" stroke-width="2" filter="url(#shadow)"/>
+  <text x="1375" y="302" class="node">계산 검증</text><text x="1375" y="326" class="small">산식 · 요건 · 조문</text>
+  <rect x="1255" y="455" width="240" height="88" rx="12" fill="#fff" stroke="#9b69bf" stroke-width="2" filter="url(#shadow)"/>
+  <text x="1375" y="492" class="node">근거 · 인용 검증</text><text x="1375" y="516" class="small">근거 밖 인용 제외</text>
+  <rect x="1235" y="670" width="280" height="122" rx="16" fill="#0a659f" filter="url(#shadow)"/>
+  <text x="1375" y="714" font-family="Arial,'Noto Sans KR',sans-serif" font-size="19" font-weight="700" fill="#fff" text-anchor="middle">최종 답변</text>
+  <text x="1375" y="742" font-family="Arial,'Noto Sans KR',sans-serif" font-size="14" fill="#fff" text-anchor="middle">검토 결론 · 적용 기준</text>
+  <text x="1375" y="766" font-family="Arial,'Noto Sans KR',sans-serif" font-size="14" fill="#fff" text-anchor="middle">담당자 조치 · 근거 조문</text>
+
+  <path d="M195 332 L195 390" class="line"/><path d="M195 535 L195 595" class="line"/><path d="M195 688 L195 730" class="line"/>
+  <path d="M300 644 L440 290" class="line"/><path d="M580 323 L495 387" class="line"/><path d="M580 323 L665 387" class="line"/>
+  <path d="M495 480 L555 543" class="line"/><path d="M665 480 L605 543" class="line"/><path d="M718 592 L895 350" class="line"/>
+  <path d="M990 400 L990 460" class="line"/><path d="M990 557 L990 630" class="line"/><path d="M1080 710 L1250 320" class="line"/><path d="M990 785 L1250 500" class="line"/>
+  <path d="M1375 353 L1375 450" class="line"/><path d="M1375 543 L1375 665" class="line"/>
+  <text x="1135" y="523" class="label">계산 필요</text><text x="1115" y="730" class="label">일반 검토</text>
+</svg>

@@ -572,16 +572,162 @@ def standard_data() -> None:
     """색인된 기준 데이터와 인프라 설정 상태를 보여준다."""
     header("기준 데이터", "기준 데이터 관리", "AI가 인용할 회계기준·법령·판례의 출처와 갱신 상태를 관리합니다.")
     health = call_api("/health")
+    refresh = call_api("/knowledge-refresh/status")
     database = health.get("database", {}).get("status", "API 연결 필요")
     columns = st.columns(3)
     with columns[0]: card("K-IFRS 색인", "53건")
     with columns[1]: card("일반기업회계기준 색인", "36건")
     with columns[2]: card("POSTGRESQL 상태", database)
+    if refresh.get("state") != "not_started":
+        completed = int(refresh.get("completed", 0))
+        total = int(refresh.get("total", 0))
+        st.markdown("### 지식기반 갱신 진행률")
+        if total:
+            st.progress(min(completed / total, 1.0), text=f"{refresh.get('stage', '갱신 중')} — {completed:,} / {total:,}")
+        else:
+            st.info(refresh.get("stage", "갱신 준비 중"))
+        st.caption(f"상태: {refresh.get('state', 'unknown')} · 마지막 기록: {refresh.get('updated_at', '-')}")
     st.table([
         {"유형": "회계기준", "원천": "ifrs 폴더", "상태": "색인 완료"},
         {"유형": "법령·판례", "원천": "국가법령정보 API", "상태": "갱신 완료"},
         {"유형": "사내지침", "원천": "담당자 업로드", "상태": "준비 필요"},
     ])
+
+
+def knowledge_chat() -> None:
+    """자연어 질문을 내부 활성 분석 결과와 승인된 회계·세무 근거로 답변한다."""
+    header("자연어 질의", "회계·세무 지식 챗봇", "내부 활성 분석 결과와 승인된 법령·판례·회계기준만 활용해 답변합니다.")
+    st.caption("답변은 잠정적인 검토 보조 정보이며, 내부 데이터가 없거나 근거가 부족한 경우 그 사실을 표시합니다.")
+    refresh_status = call_api("/knowledge-refresh/status")
+    knowledge_version = f"{refresh_status.get('state', 'unknown')}|{refresh_status.get('updated_at', '')}"
+    if "knowledge_chat_messages" not in st.session_state:
+        st.session_state["knowledge_chat_messages"] = []
+    chat_ui_version = "3"
+    if st.session_state["knowledge_chat_messages"] and (
+        st.session_state.get("knowledge_chat_version") != knowledge_version
+        or st.session_state.get("knowledge_chat_ui_version") != chat_ui_version
+    ):
+        st.session_state["knowledge_chat_messages"] = []
+        st.info("답변 형식 또는 지식기반이 갱신되어 이전 대화 결과를 초기화했습니다. 질문을 다시 제출해 최신 근거로 답변을 받으세요.")
+    st.session_state["knowledge_chat_version"] = knowledge_version
+    st.session_state["knowledge_chat_ui_version"] = chat_ui_version
+    def render_evidence_sources(sources: list[dict[str, str | None]]) -> None:
+        """답변에 실제 전달된 법령명·조문·원문 링크를 함께 표시한다."""
+        if not sources:
+            return
+        with st.expander("답변에 사용한 근거 조문", expanded=False):
+            for source in sources:
+                label = source["title"]
+                if source.get("hierarchy_path"):
+                    label += f" · {source['hierarchy_path']}"
+                if source.get("article"):
+                    label += f" · {source['article']}"
+                if source.get("source_url"):
+                    st.markdown(f"- [{label}]({source['source_url']})")
+                else:
+                    st.markdown(f"- {label}")
+
+    def render_highlighted_answer(content: str, highlight_terms: list[str]) -> None:
+        """AI가 지정한 검증 가능한 핵심 문구만 배경색과 굵은 글씨로 강조한다."""
+        terms = list(dict.fromkeys(term for term in highlight_terms if term and term in content))
+        if not terms:
+            st.write(content)
+            return
+        pattern = re.compile("|".join(re.escape(term) for term in sorted(terms, key=len, reverse=True)))
+
+        def emphasize(match: re.Match[str]) -> str:
+            value = match.group(0).replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+            return f":yellow-background[**{value}**]"
+
+        st.markdown(pattern.sub(emphasize, content))
+
+    def recent_conversation() -> list[dict[str, str]]:
+        """최근 질의·핵심 답변만 전달해 후속 질문의 문맥과 토큰 사용량을 함께 관리한다."""
+        turns: list[dict[str, str]] = []
+        pending_question = ""
+        for message in st.session_state["knowledge_chat_messages"]:
+            if message["role"] == "user":
+                pending_question = str(message["content"]).strip()
+            elif pending_question and message["role"] == "assistant":
+                details = message.get("details", {})
+                key_answer = str(details.get("key_answer") or message["content"]).strip()
+                if key_answer:
+                    turns.append({"question": pending_question[:500], "key_answer": key_answer[:800]})
+                pending_question = ""
+        return turns[-3:]
+
+    def render_assistant_details(details: dict[str, object], message_index: int) -> None:
+        """핵심 결론과 근거·후속 질문을 답변 아래에 일관되게 표시한다."""
+        key_answer = str(details.get("key_answer") or "").strip()
+        if key_answer:
+            st.info(f"**핵심 답변**\n\n{key_answer}", icon=":material/lightbulb:")
+        scope = str(details.get("scope") or "")
+        if scope and not scope.startswith("PostgreSQL 미설정"):
+            st.caption("조회 범위: " + scope)
+        st.caption(f"검색 근거: {details.get('evidence_count', 0)}건 · 지식기반 기준: {details.get('knowledge_updated_at', '-')}")
+        render_evidence_sources(details.get("evidence_sources", []))
+        hidden_system_messages = ("PostgreSQL", "내부 거래", "Risk Score", "검토 이력", "조치 현황")
+        for limitation in details.get("limitations", []):
+            if not any(marker in str(limitation) for marker in hidden_system_messages):
+                st.info(str(limitation))
+        follow_up_questions = details.get("follow_up_questions", [])
+        if isinstance(follow_up_questions, list) and follow_up_questions:
+            st.caption("이어서 물어보기")
+            for question_index, question in enumerate(follow_up_questions):
+                if st.button(str(question), key=f"knowledge_follow_up_{message_index}_{question_index}", width="stretch"):
+                    st.session_state["knowledge_pending_prompt"] = str(question)
+                    st.rerun()
+
+    for message_index, message in enumerate(st.session_state["knowledge_chat_messages"]):
+        with st.chat_message(message["role"]):
+            if message["role"] == "assistant" and message.get("details"):
+                render_highlighted_answer(message["content"], message["details"].get("highlight_terms", []))
+            else:
+                st.write(message["content"])
+            if message.get("details"):
+                render_assistant_details(message["details"], message_index)
+    typed_prompt = st.chat_input("예: 이번 달 고위험 특수관계자 거래와 관련 법령을 알려줘", submit_mode="disable")
+    prompt = st.session_state.pop("knowledge_pending_prompt", None) or typed_prompt
+    if prompt:
+        st.session_state["knowledge_chat_messages"].append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.write(prompt)
+        with st.chat_message("assistant"):
+            with st.spinner("내부 분석 결과와 근거 문서를 조회하고 있습니다."):
+                result = call_api(
+                    "/knowledge-chat",
+                    "POST",
+                    {"question": prompt, "conversation": recent_conversation()},
+                    timeout_seconds=120,
+                )
+            if "error" in result:
+                st.error(result["error"])
+            else:
+                answer = result["answer"]
+                render_highlighted_answer(answer.get("answer", "답변을 생성하지 못했습니다."), answer.get("highlight_terms", []))
+                details = {
+                    "scope": result.get("internal_context", {}).get("scope", "정보 없음"),
+                    "evidence_ids": answer.get("evidence_ids", []),
+                    "limitations": answer.get("limitations", []),
+                    "evidence_count": len(result.get("evidence_documents", [])),
+                    "knowledge_updated_at": refresh_status.get("updated_at", "-"),
+                    "key_answer": answer.get("key_answer", ""),
+                    "follow_up_questions": answer.get("follow_up_questions", []),
+                    "highlight_terms": answer.get("highlight_terms", []),
+                    "evidence_sources": [
+                        {
+                            "document_id": document["document_id"],
+                            "title": document["title"],
+                            "article": document.get("article"),
+                            "hierarchy_path": document.get("hierarchy_path"),
+                            "source_url": document.get("source_url"),
+                        }
+                        for document in result.get("evidence_documents", [])
+                        if document["document_id"] in answer.get("evidence_ids", [])
+                    ],
+                }
+                st.session_state["knowledge_chat_messages"].append({"role": "assistant", "content": answer.get("answer", ""), "details": details})
+                render_assistant_details(details, len(st.session_state["knowledge_chat_messages"]) - 1)
 
 
 def review_report() -> None:
@@ -646,11 +792,11 @@ def main() -> None:
     with st.sidebar:
         st.markdown('<p class="brand">회계·세무 리스크 분석</p><p class="brand-sub">포스코퓨처엠 AI</p>', unsafe_allow_html=True)
         st.divider()
-        page = st.radio("메뉴", ["대시보드", "거래 분석", "예상 거래 사전진단", "기준 데이터 관리", "AI 검토 보고서"], label_visibility="collapsed")
+        page = st.radio("메뉴", ["대시보드", "거래 분석", "예상 거래 사전진단", "기준 데이터 관리", "지식 챗봇", "AI 검토 보고서"], label_visibility="collapsed")
         st.divider()
         st.caption("● AI 분석 준비 상태")
     st.text_input("통합 검색", placeholder="거래 또는 법령을 검색합니다.", disabled=True)
-    {"대시보드": dashboard, "거래 분석": risk_analysis, "예상 거래 사전진단": expected_transaction, "기준 데이터 관리": standard_data, "AI 검토 보고서": review_report}[page]()
+    {"대시보드": dashboard, "거래 분석": risk_analysis, "예상 거래 사전진단": expected_transaction, "기준 데이터 관리": standard_data, "지식 챗봇": knowledge_chat, "AI 검토 보고서": review_report}[page]()
 
 
 if __name__ == "__main__":

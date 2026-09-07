@@ -85,6 +85,19 @@ def load_active_history(company_code: str, analysis_year_month: str) -> list[dic
         return [dict(row) for row in connection.execute(statement, {"company_code": company_code, "analysis_year_month": analysis_year_month}).mappings()]
 
 
+def load_read_only_chat_context(limit: int = 20) -> dict:
+    """자연어 챗봇에 전달할 활성 분석 버전과 고위험 후보만 읽기 전용으로 묶는다."""
+    with _engine().connect() as connection:
+        runs = [dict(row) for row in connection.execute(text("SELECT company_code, analysis_year_month, version_number, ledger_record_count, finding_count FROM analysis_runs WHERE is_active = TRUE ORDER BY analysis_year_month DESC LIMIT 12")).mappings()]
+        findings = [dict(row) for row in connection.execute(text("""SELECT run.company_code, run.analysis_year_month, run.version_number,
+            finding.voucher_number, finding.line_number, finding.account_name, finding.counterparty_name,
+            finding.amount, finding.risk_score, finding.risk_level, finding.reasons
+            FROM risk_findings finding JOIN analysis_runs run ON run.run_id = finding.run_id
+            WHERE run.is_active = TRUE ORDER BY finding.risk_score DESC, finding.amount DESC LIMIT :limit"""), {"limit": limit}).mappings()]
+    return {"scope": "활성 분석 기준 버전의 분석 실행 및 Risk Finding", "analysis_runs": runs, "risk_findings": findings,
+            "unavailable_data": ["특수관계자 Master", "담당자 검토 이력", "조치 현황", "사내지침"]}
+
+
 def finding_key(record: dict) -> str:
     """월이 달라도 같은 거래군 위험후보인지 비교하는 안정적인 식별자다."""
     return "|".join(str(record.get(name, "")) for name in ("company_code", "account_code", "counterparty_code", "debit_credit"))
