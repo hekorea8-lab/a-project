@@ -10,7 +10,7 @@
         <mxCell id="user" value="회계·세무·감사 담당자" style="ellipse;whiteSpace=wrap;html=1;fillColor=#0874BD;strokeColor=#075F9F;fontColor=#FFFFFF;fontSize=16;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="55" y="145" width="170" height="76" as="geometry"/></mxCell>
 
         <mxCell id="presentation" value="프레젠테이션 계층" style="swimlane;html=1;startSize=34;rounded=1;fillColor=#E8F4FD;strokeColor=#78B8E0;fontColor=#075F9F;fontStyle=1;fontSize=15;" vertex="1" parent="1"><mxGeometry x="270" y="105" width="250" height="175" as="geometry"/></mxCell>
-        <mxCell id="ui" value="Streamlit 화면&#xa;&#xa;대시보드 · 업로드 · 거래 검토&#xa;보고서 · 지식 챗봇" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#0874BD;strokeWidth=2;fontColor=#163249;fontSize=14;fontStyle=1;" vertex="1" parent="presentation"><mxGeometry x="25" y="58" width="200" height="90" as="geometry"/></mxCell>
+        <mxCell id="ui" value="FastAPI 웹 화면&#xa;&#xa;대시보드 · 업로드 · 거래 검토&#xa;보고서 · 지식 챗봇" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#0874BD;strokeWidth=2;fontColor=#163249;fontSize=14;fontStyle=1;" vertex="1" parent="presentation"><mxGeometry x="25" y="58" width="200" height="90" as="geometry"/></mxCell>
 
         <mxCell id="application" value="애플리케이션 계층" style="swimlane;html=1;startSize=34;rounded=1;fillColor=#EEF9F3;strokeColor=#8DCFA9;fontColor=#207447;fontStyle=1;fontSize=15;" vertex="1" parent="1"><mxGeometry x="565" y="105" width="430" height="570" as="geometry"/></mxCell>
         <mxCell id="api" value="FastAPI 백엔드" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DFF3E8;strokeColor=#35A46E;strokeWidth=2;fontStyle=1;fontSize=15;" vertex="1" parent="application"><mxGeometry x="105" y="52" width="220" height="55" as="geometry"/></mxCell>
@@ -241,3 +241,4 @@
     </mxGraphModel>
   </diagram>
 </mxfile>
+

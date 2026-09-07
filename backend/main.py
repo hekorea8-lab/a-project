@@ -1,4 +1,4 @@
-"""Streamlit 화면이 호출하는 회계·세무 리스크 PoC API다."""
+"""FastAPI 웹 화면이 호출하는 회계·세무 리스크 PoC API다."""
 
 import os
 import re
@@ -187,7 +187,7 @@ def admin_web_html() -> str:
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def web_app() -> HTMLResponse:
-    """별도 Streamlit 없이 PoC의 주요 업무 흐름을 직접 제공하는 웹 화면이다."""
+    """별도 FastAPI 기반으로 PoC의 주요 업무 흐름을 직접 제공하는 웹 화면이다."""
     # 계산은 자연어 답변 안에서만 제공하고, 예상 거래 사전진단은 챗봇의 접힌 보조정보로 통합한다.
     html = re.sub(r'<div class="panel"><h3>세액·가산세 계산</h3>.*?<div id="calc-result" class="result"></div></div>', '', INTEGRATED_WEB_APP_HTML)
     # 제거한 계산 화면의 버튼 초기화 코드가 남으면 null.onclick 예외로 이후 챗봇 이벤트까지 등록되지 않는다.
@@ -1009,3 +1009,4 @@ def expected_transaction_diagnose(payload: ExpectedTransactionRequest) -> dict[s
         }
     except (EvidenceSearchError, AiReviewError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
+

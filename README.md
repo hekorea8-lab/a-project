@@ -43,19 +43,11 @@ Copy-Item .env.example .env
 
 `index-embeddings`는 사용자가 직접 실행할 때만 OpenAI 임베딩 API를 호출합니다. 실행 전 PostgreSQL 서버에 `pgvector` 확장을 설치·사용할 권한과 `.env`의 `POSTGRES_*`, `OPENAI_API_KEY` 설정이 필요합니다. 설정이 없거나 벡터 검색에 실패한 경우에도 검색은 기존 키워드 방식으로 동작합니다.
 
-## 화면·백엔드 실행
+## FastAPI 실행
 
-Streamlit 화면과 FastAPI 백엔드는 분리돼 있으며, 화면은 HTTP API만 호출합니다.
-
-```powershell
-# 터미널 1: FastAPI 백엔드
-.\.venv\Scripts\uvicorn.exe backend.main:app --reload
-
-# 터미널 2: Streamlit 화면
-.\.venv\Scripts\streamlit.exe run frontend/streamlit_app.py
-```
-
-PostgreSQL은 `.env`의 `POSTGRES_HOST`, `POSTGRES_DATABASE`, `POSTGRES_USER`, `POSTGRES_PASSWORD`를 모두 입력한 경우에만 연결을 시도합니다. 현재 단계에서는 DB를 생성하거나 SAP 거래 데이터를 저장하지 않습니다.
+`powershell
+.\.venv\Scripts\uvicorn.exe app:app --reload
+` 
 
 ## OpenAI 근거 기반 검토
 
@@ -82,3 +74,4 @@ $env:KNOWLEDGE_DB_PATH = "data/knowledge.db"
 
 - 예규·해석사례의 공식 수집 원천은 아직 확정되지 않아 자동 수집하지 않습니다.
 - 법적 적용 여부는 자동으로 판단하지 않으며, 담당자 검토를 전제로 합니다.
+
