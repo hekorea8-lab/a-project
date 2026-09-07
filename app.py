@@ -12,6 +12,7 @@ import os
 import re
 import sqlite3
 import sys
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -3208,6 +3209,17 @@ class CompanySpecializeRequest(BaseModel):
     base_answer: str = Field(default="", max_length=8_000)
 
 
+class KnowledgeReportPptxRequest(BaseModel):
+    """챗봇 답변과 검색 근거를 포스코 양식 PPT로 산출하는 요청이다."""
+
+    question: str = Field(min_length=2, max_length=1_000)
+    knowledge_track: str = Field(default="accounting", pattern="^(accounting|tax)$")
+    answer: str = Field(default="", max_length=12_000)
+    key_answer: str = Field(default="", max_length=2_000)
+    limitations: list[str] = Field(default_factory=list, max_length=10)
+    evidence: list[dict[str, object]] = Field(default_factory=list, max_length=15)
+
+
 class RiskScoreRequest(BaseModel):
     """SAP 원장·특수관계자 CSV를 분석 월 기준으로 선별하는 요청이다."""
 
@@ -4534,6 +4546,10 @@ def web_app() -> HTMLResponse:
     """별도 Streamlit 없이 PoC의 주요 업무 흐름을 직접 제공하는 웹 화면이다."""
     # 계산은 자연어 답변 안에서만 제공하고, 예상 거래 사전진단은 챗봇의 접힌 보조정보로 통합한다.
     html = re.sub(r'<div class="panel"><h3>세액·가산세 계산</h3>.*?<div id="calc-result" class="result"></div></div>', '', INTEGRATED_WEB_APP_HTML)
+    # 대시보드·거래 분석은 현재 업무 흐름에서 제외하고 챗봇을 첫 화면으로 연다.
+    html = html.replace('<button data-view="dashboard" class="active">대시보드</button>', '<button data-view="dashboard">대시보드</button>')
+    html = html.replace('<section id="dashboard" class="view active">', '<section id="dashboard" class="view">')
+    html = html.replace('<section id="chat" class="view">', '<section id="chat" class="view active">')
     # 제거한 계산 화면의 버튼 초기화 코드가 남으면 null.onclick 예외로 이후 챗봇 이벤트까지 등록되지 않는다.
     html = re.sub(r'async function runTaxCalculation\(\).*?\$\(\'calc-run\'\)\.onclick=runTaxCalculation;', '', html)
     html = html.replace('<button data-view="expected">예상 거래 사전진단</button>', '')
@@ -4668,10 +4684,10 @@ def web_app() -> HTMLResponse:
     )
     chat_script = chat_script.replace(
         "add('answer',body)};const submit=",
-        "const rendered=add('answer',body);rendered.dataset.question=payload.question||'';rendered.dataset.baseAnswer=(answer.key_answer||'')+'\\n'+(answer.answer||'')};const submit=",
+        "const reportId='report-'+Date.now()+'-'+Math.random().toString(36).slice(2);window.__chatReports=window.__chatReports||{};window.__chatReports[reportId]={question:payload.question||'',knowledge_track:track.value,key_answer:answer.key_answer||'',answer:answer.answer||'',limitations:answer.limitations||[],evidence:used};body+='<div class=\\\"report-actions\\\"><button type=\\\"button\\\" class=\\\"ppt-report-button\\\" data-ppt-report=\\\"'+reportId+'\\\">포스코 양식 검토보고서 PPT 생성</button></div>';const rendered=add('answer',body);rendered.dataset.question=payload.question||'';rendered.dataset.baseAnswer=(answer.key_answer||'')+'\\n'+(answer.answer||'')};const submit=",
     )
     chat_script = chat_script.replace(
-        "const globalLoader=document.createElement('div');",
+        "const pptReport=async button=>{const report=window.__chatReports[button.dataset.pptReport];if(!report)return;button.disabled=true;button.textContent='PPT 생성 중…';try{const response=await fetch('/knowledge-chat/report-pptx',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(report)});if(!response.ok){const error=await response.json().catch(()=>({}));throw new Error(error.detail||'PPT를 생성하지 못했습니다.')}const blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='포스코퓨처엠_검토보고서.pptx';link.click();URL.revokeObjectURL(url);button.textContent='PPT 다운로드 완료'}catch(error){button.disabled=false;button.textContent=error.message||'PPT 생성 실패'}};chat.addEventListener('click',event=>{const button=event.target.closest('[data-ppt-report]');if(button)pptReport(button)});const globalLoader=document.createElement('div');",
         "const specialize=async button=>{const card=button.closest('.message'),question=String(card?.dataset.question||'').trim();if(!question)return;button.disabled=true;button.textContent='포스코퓨처엠 관점으로 검토 중…';try{const response=await fetch('/knowledge-chat/company-specialize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,knowledge_track:track.value,base_answer:String(card?.dataset.baseAnswer||'')})});const payload=await response.json();if(!response.ok)throw new Error(payload.detail||'회사 특화 검토를 생성하지 못했습니다.');payload.question=question;render(payload)}catch(error){button.disabled=false;button.textContent=error.message||'회사 특화 검토를 다시 시도하세요.'}};chat.addEventListener('click',event=>{const button=event.target.closest('[data-company-specialize]');if(button)specialize(button)});const globalLoader=document.createElement('div');",
     )
     # 화면 조합 과정에서 로딩 효과가 빠지면 조용히 배포하지 않고 즉시 오류로 드러낸다.
@@ -4685,6 +4701,8 @@ def web_app() -> HTMLResponse:
     html = html.replace("</style>", ".company-specialize{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:15px;padding:12px;background:#eef7ff;border:1px solid #cce3f5;border-radius:9px}.company-specialize button{border:0;border-radius:7px;padding:9px 12px;background:#0868b8;color:#fff;font:inherit;font-weight:800;cursor:pointer}.company-specialize button:disabled{opacity:.7;cursor:wait}.company-specialize span{color:#5d7183;font-size:12px}</style>")
     html = html.replace("</style>", ".loading{padding:0!important;background:transparent!important;border:0!important}.loading-panel{display:flex;align-items:center;gap:14px;width:100%;padding:16px 18px;background:linear-gradient(110deg,#f7fbff,#e9f4fd);border:1px solid #c9e0f2;border-radius:9px;box-shadow:0 8px 22px rgba(24,98,158,.09);animation:loading-enter .28s ease-out}.chat-orbit{position:relative;display:block;flex:0 0 34px;width:34px;height:34px;border:3px solid #b8d9ef;border-top-color:#0874bd;border-right-color:#0874bd;border-radius:50%;animation:chat-spin .75s linear infinite}.chat-orbit:after{content:'';position:absolute;inset:7px;border:2px solid transparent;border-bottom-color:#ff5a5f;border-radius:50%;animation:chat-spin 1.05s linear infinite reverse}.loading-copy{display:flex;flex:1;flex-direction:column;gap:4px;min-width:0}.loading-copy strong{font-size:13px;color:#075e9f;letter-spacing:.01em}.chat-progress{font-size:14px;color:#334d63}.loading-track{display:block;overflow:hidden;width:100%;height:4px;background:#d5e7f4;border-radius:6px;margin-top:5px}.loading-track i{display:block;width:42%;height:100%;border-radius:6px;background:linear-gradient(90deg,#0874bd,#63b7e7,#0874bd);animation:loading-sweep 1.35s ease-in-out infinite}@keyframes loading-enter{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}@keyframes loading-sweep{from{transform:translateX(-110%)}to{transform:translateX(270%)}}</style>")
     html = html.replace("</style>", ".global-request-loader{position:fixed;z-index:9999;top:18px;right:22px;display:flex;align-items:center;gap:9px;padding:10px 14px;background:#073e69;color:#fff;border:1px solid #4da6dc;border-radius:24px;box-shadow:0 8px 22px rgba(4,48,82,.22);font-size:13px;font-weight:800;opacity:0;transform:translateY(-12px);pointer-events:none;transition:opacity .18s,transform .18s}.global-request-loader.visible{opacity:1;transform:translateY(0)}.global-orbit{width:15px;height:15px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;animation:chat-spin .65s linear infinite}@media(max-width:760px){.global-request-loader{top:10px;right:10px}}</style>")
+    html = html.replace("</style>", ".nav button[data-view=dashboard],.nav button[data-view=analysis],#dashboard,#analysis{display:none!important}</style>", 1)
+    html = html.replace("</style>", ".report-actions{display:flex;justify-content:flex-end;margin-top:16px}.ppt-report-button{border:0;border-radius:7px;padding:10px 14px;background:#0a6fba;color:#fff;font:inherit;font-weight:800;cursor:pointer}.ppt-report-button:disabled{opacity:.7;cursor:wait}</style>", 1)
     html = html.replace("</script></body>", "</script><script>" + chat_script + "</script></body>")
     # 인라인 이벤트가 포함된 단일 화면은 이전 HTML이 남으면 버튼 수정도 반영되지 않으므로 캐시하지 않는다.
     return HTMLResponse(html, headers={"Cache-Control": "no-store, max-age=0"})
@@ -5324,6 +5342,39 @@ def accounting_standard_source(document_id: str) -> FileResponse:
     if not source_path.is_file():
         raise HTTPException(status_code=404, detail="회계기준 원문 파일을 찾지 못했습니다.")
     return FileResponse(source_path, media_type="application/pdf", content_disposition_type="inline")
+
+
+@app.post("/knowledge-chat/report-pptx")
+def knowledge_chat_report_pptx(payload: KnowledgeReportPptxRequest) -> FileResponse:
+    """현재 챗봇 답변을 포스코퓨처엠 검토보고서 PPT로 변환한다."""
+    build_dir = PROJECT_ROOT / ".ppt-build"
+    output_dir = PROJECT_ROOT / "outputs" / "reports"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    input_path = build_dir / f"report_{stamp}.json"
+    output_path = output_dir / f"포스코퓨처엠_검토보고서_{stamp}.pptx"
+    input_path.write_text(json.dumps({
+        "title": "회계·세무 검토보고서",
+        "organization": "회계세무그룹",
+        "date": datetime.now().strftime("'%y. %-m. %-d.") if os.name != "nt" else datetime.now().strftime("'%y. %m. %d.").replace(" 0", " "),
+        "question": payload.question,
+        "key_answer": payload.key_answer,
+        "answer": payload.answer,
+        "limitations": payload.limitations,
+        "evidence": payload.evidence,
+    }, ensure_ascii=False), encoding="utf-8")
+    node = os.environ.get("CODEX_NODE", r"C:\Users\POSCOFUTUREM\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe")
+    skill_dir = r"C:\Users\POSCOFUTUREM\.codex\plugins\cache\openai-primary-runtime\presentations\26.904.11930\skills\Presentations"
+    try:
+        completed = subprocess.run([node, str(PROJECT_ROOT / "ppt_report_generator.mjs"), str(input_path), str(output_path)], env={**os.environ, "SKILL_DIR": skill_dir}, capture_output=True, text=True, timeout=90)
+        if completed.returncode != 0 or not output_path.is_file():
+            raise RuntimeError(completed.stderr[-800:] or "PPT 산출 실패")
+    except Exception as error:
+        raise HTTPException(status_code=503, detail=f"검토보고서 PPT를 생성하지 못했습니다: {error}") from error
+    finally:
+        input_path.unlink(missing_ok=True)
+    return FileResponse(output_path, media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation", filename=output_path.name)
 
 
 @app.post("/knowledge-chat")
