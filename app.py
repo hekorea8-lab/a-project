@@ -5982,6 +5982,25 @@ def run_quality_checks(args: argparse.Namespace) -> None:
             self.assertEqual(len(result["evidence_documents"]), 2)
             self.assertTrue(all(item.get("document_id") for item in result["evidence_documents"]))
 
+        def test_answer_quality_business_resident_tax(self):
+            """실제 세무 답변이 결론·근거·계산·확인사항을 모두 포함"""
+            evidence = [{"document_id": "83", "title": "지방세법", "article": "제83조", "metadata": {}}, {"document_id": "55", "title": "지방세기본법", "article": "제55조", "metadata": {}}]
+            with patch.object(module, "legal_article_evidence", side_effect=lambda title, article: [next(item for item in evidence if item["title"] == title)]):
+                result = business_resident_tax_late_advice("사업소분 주민세 납부가 늦었는데 가산세 얼마인가요 100만원")
+            full_text = result["key_answer"] + "\n" + result["answer"]
+            for required in ("8월 31일", "지방세법 제83조", "지방세기본법 제55조", "1,540원", "7일"):
+                self.assertIn(required, full_text)
+            self.assertNotIn("모르", full_text)
+
+        def test_answer_quality_missing_amount_is_actionable(self):
+            """금액이 없을 때도 납기·공식·필요 입력을 제시"""
+            evidence = [{"document_id": "83", "title": "지방세법", "article": "제83조", "metadata": {}}, {"document_id": "55", "title": "지방세기본법", "article": "제55조", "metadata": {}}]
+            with patch.object(module, "legal_article_evidence", side_effect=lambda title, article: [next(item for item in evidence if item["title"] == title)]):
+                result = business_resident_tax_late_advice("사업소분 주민세 납부가 늦었는데 가산세가 있나요?")
+            full_text = result["key_answer"] + "\n" + result["answer"]
+            self.assertIn("미납세액 × 적용 일일요율 × 지연일수", full_text)
+            self.assertTrue(any("미납세액" in item for item in result["follow_up_questions"]))
+
     class RecordedResult(unittest.TextTestResult):
         def startTest(self, test):
             super().startTest(test)
