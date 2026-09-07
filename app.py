@@ -4654,7 +4654,7 @@ def web_app() -> HTMLResponse:
     )
     chat_script = chat_script.replace(
         "let body=answer.key_answer?'<div class=\"key\">핵심 안내<br>'+esc(answer.key_answer)+'</div>':'';",
-        "let body=answer.key_answer?'<div class=\"key\">핵심 안내<br>'+highlighted(answer.key_answer,answer.highlight_terms)+'</div>':'';if(answer.calculation){const calc=answer.calculation;body+='<section class=\"calculation-card\"><div class=\"answer-section-label\">근거 기반 추정계산</div><b>'+esc(calc.result_amount!=null?Number(calc.result_amount).toLocaleString('ko-KR')+'원':'계산에 필요한 값 확인 중')+'</b>'+(calc.formula?'<p>'+esc(calc.formula)+'</p>':'')+(calc.overdue_days!=null?'<p>지연일수 '+esc(calc.overdue_days)+'일 · 적용 일일요율 '+esc(calc.daily_rate_percent)+'%</p>':'')+'</section>'}",
+        "let body=answer.key_answer?'<div class=\"key\">핵심 안내<br>'+highlighted(answer.key_answer,answer.highlight_terms)+'</div>':'';if(answer.calculation){const calc=answer.calculation;const hasResult=calc.result_amount!=null;const example=calc.example_result!=null?'예시(미납세액 100만원): '+Number(calc.example_result).toLocaleString('ko-KR')+'원':'';body+='<section class=\"calculation-card\"><div class=\"answer-section-label\">근거 기반 추정계산</div><b>'+esc(hasResult?Number(calc.result_amount).toLocaleString('ko-KR')+'원':example||'계산에 필요한 값 확인 중')+'</b>'+(hasResult&&calc.formula?'<p>'+esc(calc.formula)+'</p>':'')+(calc.overdue_days!=null?'<p>지연일수 '+esc(calc.overdue_days)+'일 · 적용 일일요율 '+esc(calc.daily_rate_percent)+'%</p>':'')+'</section>'}",
     )
     chat_script = chat_script.replace(
         "body+=reviewBlocks(answer.answer);",
@@ -5068,10 +5068,11 @@ def business_resident_tax_late_advice(question: str) -> dict[str, object] | None
         highlight = ["지방세법 제83조", "지방세기본법 제55조", "8월 1일~8월 31일", f"{calculated:,.0f}원"]
     else:
         key = "사업소분 주민세 신고·납부가 늦었다면 지방세기본법상 납부지연가산세를 우선 확인해야 합니다. 미납세액과 실제 납부일을 알면 예상액을 계산할 수 있습니다."
-        answer = f"[적용 기준]\n지방세법 제83조에 따라 {year}년 사업소분 주민세 신고·납부기간은 {year}년 8월 1일부터 8월 31일까지입니다. 지방세기본법 제55조에 따라 기한을 넘긴 미납세액에는 납부지연가산세가 붙을 수 있습니다.\n[검토 의견]\n오늘({today.isoformat()}) 기준으로는 법정기한 경과 여부와 실제 지연일수를 계산해야 합니다. 계산식은 미납세액 × 적용 일일요율 × 지연일수이며, 미납세액·실제 납부일·관할 지자체 고지의 적용요율을 확인한 뒤 금액을 확정하세요."
+        example_result = round(1_000_000 * daily_rate / 100 * overdue_days)
+        answer = f"[적용 기준]\n지방세법 제83조에 따라 {year}년 사업소분 주민세 신고·납부기간은 {year}년 8월 1일부터 8월 31일까지입니다. 지방세기본법 제55조에 따라 기한을 넘긴 미납세액에는 납부지연가산세가 붙을 수 있습니다.\n[검토 의견]\n오늘({today.isoformat()}) 기준 법정기한 후 {overdue_days}일이 지났습니다. 계산식은 미납세액 × 적용 일일요율 × 지연일수입니다. 예시로 미납세액 100만원과 일일요율 {daily_rate:g}%를 가정하면 약 {example_result:,}원입니다. 실제 미납세액을 입력하면 질문자의 금액으로 다시 계산합니다."
         limitations = ["미납세액, 실제 납부일, 관할 지자체 고지의 적용요율이 필요합니다."]
         highlight = ["지방세법 제83조", "지방세기본법 제55조", "8월 1일~8월 31일"]
-    return {"key_answer": key, "answer": answer, "evidence_ids": [str(item["document_id"]) for item in evidence], "limitations": limitations, "follow_up_questions": ["미납세액은 얼마인가요?", "실제 납부일은 언제인가요?", "관할 지방자치단체 고지서의 가산세 요율을 확인할 수 있나요?"], "highlight_terms": highlight, "generation_mode": "tax_deadline_rule", "calculation": {"statutory_due_date": statutory_due.isoformat(), "actual_payment_date": actual_date.isoformat(), "overdue_days": overdue_days, "daily_rate_percent": daily_rate, "amount": amount}, "evidence_documents": evidence}
+    return {"key_answer": key, "answer": answer, "evidence_ids": [str(item["document_id"]) for item in evidence], "limitations": limitations, "follow_up_questions": ["미납세액은 얼마인가요?", "실제 납부일은 언제인가요?", "관할 지방자치단체 고지서의 가산세 요율을 확인할 수 있나요?"], "highlight_terms": highlight, "generation_mode": "tax_deadline_rule", "calculation": {"statutory_due_date": statutory_due.isoformat(), "actual_payment_date": actual_date.isoformat(), "overdue_days": overdue_days, "daily_rate_percent": daily_rate, "amount": amount, "example_amount": 1_000_000 if amount is None else None, "example_result": example_result if amount is None else None}, "evidence_documents": evidence}
 
 
 def transaction_hint_from_question(question: str) -> dict[str, object] | None:
@@ -5318,6 +5319,8 @@ def run_chat_review_graph(
                 "requires_more_information": False,
                 "method": "retrieval_citation_validation",
             }
+        if answer.get("validation", {}).get("status") != "withheld" and not answer.get("generation_mode"):
+            answer["generation_mode"] = "ai_review"
         answer["follow_up_questions"] = suggested_follow_up_questions(
             state["question"], answer, state["evidence_documents"], str(state["knowledge_track"]),
         )
