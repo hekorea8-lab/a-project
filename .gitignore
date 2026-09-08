@@ -5,3 +5,10 @@
 data/
 __pycache__/
 .pytest_cache/
+.docker-data/
+node_modules/
+outputs/
+.ppt-build/
+ifrs/
+Set-ExecutionPolicy
+.agents/skills/developing-with-streamlit

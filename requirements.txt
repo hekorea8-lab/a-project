@@ -10,3 +10,4 @@ psycopg[binary]==3.3.4
 sqlalchemy==2.0.52
 uvicorn==0.52.4
 neo4j==6.1.0
+numpy==2.5.2

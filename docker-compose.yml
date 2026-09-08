@@ -1,0 +1,46 @@
+name: posco-ai
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: posco-ai-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DATABASE:-posco_ai}
+      POSTGRES_USER: ${POSTGRES_USER:-posco}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-local}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # PostgreSQL 일반 테이블과 pgvector 임베딩을 같은 영속 저장소에 보관한다.
+      - ./.docker-data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: posco-ai-neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: ${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-change-me-local}
+      NEO4J_dbms_memory_pagecache_size: 512M
+    ports:
+      - "${NEO4J_HTTP_PORT:-7474}:7474"
+      - "${NEO4J_BOLT_PORT:-7687}:7687"
+    volumes:
+      # 그래프 데이터·트랜잭션 로그·플러그인을 프로젝트 디렉터리에 영속화한다.
+      - ./.docker-data/neo4j/data:/data
+      - ./.docker-data/neo4j/logs:/logs
+      - ./.docker-data/neo4j/plugins:/plugins
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+networks:
+  default:
+    name: posco-ai-network

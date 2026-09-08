@@ -49,6 +49,17 @@ Copy-Item .env.example .env
 .\.venv\Scripts\uvicorn.exe app:app --reload
 ` 
 
+## PostgreSQL·pgvector·Neo4j 영속 저장소
+
+`docker-compose.yml`은 PostgreSQL과 pgvector를 하나의 PostgreSQL 서비스로 실행하고, Neo4j를 별도 서비스로 실행합니다. 일반 PostgreSQL 테이블과 pgvector 임베딩은 `./.docker-data/postgres`, Neo4j 그래프·로그·플러그인은 `./.docker-data/neo4j` 아래에 저장됩니다.
+
+```powershell
+docker compose up -d postgres neo4j
+docker compose ps
+```
+
+컨테이너를 내렸다가 다시 올려도 프로젝트의 `.docker-data`가 유지되는 한 데이터는 보존됩니다. `.docker-data/`는 Git에 올리지 않도록 제외되어 있으며, 운영 환경에서는 `.env`의 데이터베이스 비밀번호를 반드시 별도로 설정합니다.
+
 ## OpenAI 근거 기반 검토
 
 AI 검토 API는 지정 모델 `gpt-5.6-terra`를 사용합니다. `.env`에 `OPENAI_API_KEY`를 직접 입력한 경우에만 실제 호출을 수행합니다. 키는 코드·화면·로그·보고서에 표시하지 않습니다.
