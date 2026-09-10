@@ -31,6 +31,21 @@ ANALYTICS_STOPWORDS = {"알려줘", "알려주세요", "얼마", "계산", "어�
 ADMIN_CREDENTIALS = HTTPBasic(auto_error=False)
 
 
+def langsmith_invoke_config(question: str, knowledge_track: str | None = None,
+                            review_mode: str | None = None, retrieval_id: str | None = None) -> dict[str, object]:
+    """LangSmith trace에 원문 대신 안전한 식별자와 운영 메타데이터만 전달한다."""
+    return {
+        "run_name": "posco-accounting-tax-review-api",
+        "tags": ["posco", "accounting-tax", *(item for item in (knowledge_track, review_mode) if item)],
+        "metadata": {
+            "question_hash": hashlib.sha256(question.encode("utf-8")).hexdigest(),
+            "knowledge_track": knowledge_track or "unknown",
+            "review_mode": review_mode or "unknown",
+            "retrieval_id": retrieval_id or "unknown",
+        },
+    }
+
+
 def initialize_chat_analytics() -> None:
     """관리자 검토용 질문·답변 이력을 첨부 원문 없이 저장한다."""
     ANALYTICS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -440,6 +455,18 @@ def ai_review_status() -> dict[str, str]:
     return {"model": MODEL_NAME, "status": "configured" if os.environ.get("OPENAI_API_KEY") else "not_configured"}
 
 
+@app.get("/observability/langsmith/status")
+def langsmith_status() -> dict[str, object]:
+    """LangSmith 연결 상태를 키 값 없이 확인한다."""
+    return {
+        "tracing": os.environ.get("LANGSMITH_TRACING", "false").lower() in {"1", "true", "yes", "on"},
+        "configured": bool(os.environ.get("LANGSMITH_API_KEY")),
+        "project": os.environ.get("LANGSMITH_PROJECT", "default"),
+        "inputs_hidden": os.environ.get("LANGSMITH_HIDE_INPUTS", "true").lower() in {"1", "true", "yes", "on"},
+        "outputs_hidden": os.environ.get("LANGSMITH_HIDE_OUTPUTS", "true").lower() in {"1", "true", "yes", "on"},
+    }
+
+
 @app.post("/ai-review")
 def ai_review(payload: AiReviewRequest) -> dict[str, object]:
     """승인된 근거 문서를 바탕으로 OpenAI 잠정 검토를 생성한다."""
@@ -775,7 +802,7 @@ def run_chat_review_graph(
         "attachments": attachments,
         "conversation": conversation or [],
         "expert_mode": expert_mode,
-    })
+    }, config=langsmith_invoke_config(question, None, "expert" if expert_mode else "simple"))
     return result["answer"]
 
 

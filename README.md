@@ -66,6 +66,18 @@ AI 검토 API는 지정 모델 `gpt-5.6-terra`를 사용합니다. `.env`에 `OP
 
 `POST /ai-review`는 거래 사실과 승인된 근거 문서를 받아 잠정 검토 결과를 반환합니다. AI 응답은 근거 문서 ID를 포함해야 하며, 제공되지 않은 문서 ID를 인용한 경우 별도로 표시합니다.
 
+## LangSmith 추적
+
+LangGraph·LangChain 실행 추적은 기본적으로 비활성화되어 있습니다. `.env`에 `LANGSMITH_API_KEY`를 입력하고 `LANGSMITH_TRACING=true`로 설정하면 LangSmith 프로젝트에 단계별 실행·오류·성능 정보를 전송합니다. 질문·모델 입력·출력은 기본적으로 숨기고, trace 메타데이터에는 해시와 식별자만 기록합니다. 운영 환경에서는 LangSmith의 데이터 보존·접근 정책을 회사 보안 기준에 맞춰 확인한 후 활성화합니다.
+
+```powershell
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=발급받은_키
+LANGSMITH_PROJECT=posco-accounting-tax-review
+LANGSMITH_HIDE_INPUTS=true
+LANGSMITH_HIDE_OUTPUTS=true
+```
+
 테스트 등에서 다른 데이터베이스를 MCP 서버에 연결하려면 현재 세션에서만 `KNOWLEDGE_DB_PATH`를 설정합니다.
 
 ```powershell

@@ -6,6 +6,7 @@ openai==1.109.1
 langchain-core==1.6.1
 langchain-openai==1.1.9
 langgraph==1.2.11
+langsmith==0.11.2
 psycopg[binary]==3.3.4
 sqlalchemy==2.0.52
 uvicorn==0.52.4
