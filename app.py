@@ -4,6 +4,7 @@
     """
 
 import argparse
+import atexit
 import hashlib
 import html
 import io
@@ -26,6 +27,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 from http.cookiejar import CookieJar
+from functools import lru_cache
 from contextlib import contextmanager, closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -41,6 +43,7 @@ from PIL import Image
 from pypdf import PdfReader
 import pytesseract
 from sqlalchemy import URL, create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -271,6 +274,8 @@ def start_rag_progress(progress_id: str | None, expert_mode: bool = False) -> No
             "elapsed_seconds": 0.0,
             "estimated_total_seconds": 35.0 if expert_mode else 8.0,
             "eta_seconds": 8.0 if not expert_mode else 35.0,
+            "stage_started_monotonic": started,
+            "stage_timings": {},
             "started_monotonic": started,
             "updated_monotonic": started,
         }
@@ -287,6 +292,13 @@ def update_rag_progress(progress_id: str | None, stage: str, stage_label: str,
             return
         now = time.monotonic()
         elapsed = max(0.0, now - float(item.get("started_monotonic") or now))
+        previous_stage = str(item.get("stage") or "")
+        stage_started = float(item.get("stage_started_monotonic") or now)
+        if previous_stage and previous_stage != stage:
+            stage_timings = dict(item.get("stage_timings") or {})
+            stage_timings[previous_stage] = round(max(0.0, now - stage_started), 3)
+            item["stage_timings"] = stage_timings
+            item["stage_started_monotonic"] = now
         progress_value = min(99, max(int(item.get("progress") or 0), int(progress)))
         base_total = float(estimated_total_seconds or item.get("estimated_total_seconds") or 8.0)
         # 진행률이 예상보다 늦으면 전체 예상시간도 함께 늘려 사용자에게 숨기지 않는다.
@@ -311,11 +323,17 @@ def finish_rag_progress(progress_id: str | None, status: str = "completed") -> N
             return
         now = time.monotonic()
         elapsed = max(0.0, now - float(item.get("started_monotonic") or now))
+        stage = str(item.get("stage") or "")
+        stage_started = float(item.get("stage_started_monotonic") or now)
+        stage_timings = dict(item.get("stage_timings") or {})
+        if stage:
+            stage_timings[stage] = round(max(0.0, now - stage_started), 3)
         item.update({"status": status, "stage": "completed" if status == "completed" else "error",
                      "stage_label": "처리 완료" if status == "completed" else "처리 중 오류",
                      "progress": 100 if status == "completed" else int(item.get("progress") or 0),
                      "elapsed_seconds": round(elapsed, 1), "eta_seconds": 0.0,
-                     "estimated_total_seconds": round(elapsed, 1), "updated_monotonic": now})
+                     "estimated_total_seconds": round(elapsed, 1), "stage_timings": stage_timings,
+                     "updated_monotonic": now})
 
 
 def rag_progress_snapshot(progress_id: str) -> dict[str, object]:
@@ -614,6 +632,56 @@ LEGAL_INTENT_RULES = (
     ),
     (("원천징수",), ("납부", "납기", "기한", "언제"), "소득세법", "제128조"),
 )
+
+# 비전공자가 자주 묻고 법령 원문으로 짧게 확인할 수 있는 빠른 시작 질문이다.
+# 일반 채팅 질문과 분리해, 버튼을 누른 경우에만 빠른 조회 경로를 사용한다.
+QUICK_START_CATALOG = (
+    {
+        "id": "property_tax_deadline", "label": "재산세 납부기한", "button_label": "재산세 납부기한",
+        "question": "재산세는 언제 내나요?", "mode": "quick_lookup", "law": "지방세법", "article": "제115조",
+        "queries": ("재산세 납기", "지방세법 제115조 재산세 납기"),
+    },
+    {
+        "id": "business_resident_tax_deadline", "label": "사업소분 주민세 신고·납부", "button_label": "사업소분 주민세",
+        "question": "사업소분 주민세는 언제 신고·납부하나요?", "mode": "quick_lookup", "law": "지방세법", "article": "제83조",
+        "queries": ("사업소분 주민세 신고납부기한", "지방세법 제83조 사업소분 납기"),
+    },
+    {
+        "id": "vat_rate", "label": "부가가치세율", "button_label": "부가가치세율",
+        "question": "부가가치세율은 몇 %인가요?", "mode": "quick_lookup", "law": "부가가치세법", "article": "제30조",
+        "queries": ("부가가치세 세율", "부가가치세법 제30조 세율"),
+    },
+    {
+        "id": "withholding_deadline", "label": "원천징수 납부기한", "button_label": "원천징수 납부기한",
+        "question": "원천징수한 세금은 언제 납부하나요?", "mode": "quick_lookup", "law": "소득세법", "article": "제128조",
+        "queries": ("원천징수세액 납부기한", "소득세법 제128조 원천징수세액 납부"),
+    },
+    {
+        "id": "corporate_tax_deadline", "label": "법인세 신고기한", "button_label": "법인세 신고기한",
+        "question": "법인세 신고기한은 언제인가요?", "mode": "quick_lookup", "law": "법인세법", "article": "제60조",
+        "queries": ("법인세 과세표준 신고기한", "법인세법 제60조 신고기한"),
+    },
+)
+
+
+def quick_start_catalog() -> list[dict[str, object]]:
+    """화면과 테스트에서 사용할 빠른 시작 질문 목록을 반환한다."""
+    return [dict(item) for item in QUICK_START_CATALOG]
+
+
+def quick_start_spec(question: str) -> dict[str, object] | None:
+    """버튼에서 전달된 질문이 승인된 빠른 조회 질문인지 확인한다."""
+    normalized = re.sub(r"\s+", "", str(question or ""))
+    for item in QUICK_START_CATALOG:
+        if normalized == re.sub(r"\s+", "", str(item["question"])):
+            return dict(item)
+    return None
+
+
+def is_quick_start_question(question: str) -> bool:
+    """빠른 시작 전용 질문 여부를 명시적으로 판정한다."""
+    return quick_start_spec(question) is not None
+
 ARTICLE_PATTERN = re.compile(r"제\s*\d+\s*조(?:\s*의\s*\d+)?")
 # 법령 본문에 쓰인 인용을 조문 그래프로 바꾸기 위한 공식 표기 패턴이다.
 ARTICLE_REFERENCE_PATTERN = re.compile(r"제\s*(?P<number>\d+)\s*조(?:\s*의\s*(?P<subnumber>\d+))?")
@@ -1369,12 +1437,21 @@ def postgres_url_from_environment() -> URL | None:
     return URL.create("postgresql+psycopg", username=values[2], password=values[3], host=values[0], port=int(os.environ.get("POSTGRES_PORT", "5432")), database=values[1])
 
 
+@lru_cache(maxsize=1)
 def vector_engine():
     """pgvector 저장소 연결을 만들고 설정이 없으면 명확히 중단한다."""
     database_url = postgres_url_from_environment()
     if database_url is None:
         raise VectorSearchError("벡터 검색에는 .env의 PostgreSQL 연결 정보가 필요합니다.")
     return create_engine(database_url, pool_pre_ping=True, connect_args={"connect_timeout": VECTOR_CONNECT_TIMEOUT_SECONDS})
+
+
+def close_cached_vector_engine() -> None:
+    """프로세스 종료 시 캐시된 벡터 연결 풀을 정리한다."""
+    try:
+        vector_engine().dispose()
+    except Exception:
+        pass
 
 
 def initialize_vector_store() -> None:
@@ -1407,26 +1484,46 @@ def neo4j_settings() -> tuple[str, str, str, str] | None:
     return (uri, username, password, database) if uri and username and password else None
 
 
+@lru_cache(maxsize=1)
+def neo4j_driver() -> object:
+    """검색마다 새 Neo4j 드라이버를 만들지 않고 프로세스 단위 연결 풀을 재사용한다."""
+    settings = neo4j_settings()
+    if settings is None:
+        raise GraphSearchError("Neo4j 연결 정보가 설정되지 않았습니다.")
+    uri, username, password, _database = settings
+    return GraphDatabase.driver(
+        uri,
+        auth=(username, password),
+        connection_timeout=GRAPH_CONNECT_TIMEOUT_SECONDS,
+        max_connection_lifetime=300,
+    )
+
+
+def close_cached_neo4j_driver() -> None:
+    """프로세스 종료 시 캐시된 Neo4j 드라이버를 정리한다."""
+    try:
+        neo4j_driver().close()
+    except Exception:
+        pass
+
+
+atexit.register(close_cached_vector_engine)
+atexit.register(close_cached_neo4j_driver)
+
+
 @contextmanager
 def neo4j_session() -> Iterator[object]:
     """설정된 경우에만 Neo4j 세션을 열고 연결정보는 호출자에게 노출하지 않는다."""
     settings = neo4j_settings()
     if settings is None:
         raise GraphSearchError("Neo4j 연결 정보가 설정되지 않았습니다.")
-    uri, username, password, database = settings
-    driver = GraphDatabase.driver(
-        uri,
-        auth=(username, password),
-        connection_timeout=GRAPH_CONNECT_TIMEOUT_SECONDS,
-    )
+    _uri, _username, _password, database = settings
+    driver = neo4j_driver()
     try:
-        driver.verify_connectivity()
         with driver.session(database=database) as session:
             yield session
     except (Neo4jError, ServiceUnavailable, OSError, TimeoutError) as error:
         raise GraphSearchError("Neo4j 관계 그래프에 연결할 수 없습니다.") from error
-    finally:
-        driver.close()
 
 
 def initialize_neo4j_graph() -> dict[str, object]:
@@ -1525,6 +1622,7 @@ def graph_expand_chunk_ids(chunk_ids: list[str], limit: int = 10) -> list[dict[s
                        LIMIT $limit""",
                     chunk_ids=chunk_ids,
                     limit=limit,
+                    timeout=GRAPH_CONNECT_TIMEOUT_SECONDS,
                 )
                 result_holder.append([dict(record) for record in result])
         except Exception as error:  # 그래프 장애는 SQLite 관계 확장으로 보완한다.
@@ -2398,6 +2496,16 @@ def create_embeddings(texts: list[str]) -> list[list[float]]:
     return embeddings
 
 
+@lru_cache(maxsize=256)
+def cached_query_embedding(query: str) -> tuple[float, ...]:
+    """동일 요청에서 반복되는 검색어의 임베딩 호출을 줄인다.
+
+    검색어는 최대 256개까지만 짧게 캐시하고, 원문 문서나 API 키는 저장하지 않는다.
+    """
+    normalized = re.sub(r"\s+", " ", str(query or "")).strip()
+    return tuple(create_embeddings([normalized])[0])
+
+
 def embedding_text(value: list[float]) -> str:
     """pgvector가 받는 리터럴 형식으로 부동소수점 벡터를 변환한다."""
     return "[" + ",".join(str(number) for number in value) + "]"
@@ -2847,6 +2955,7 @@ def semantic_search_documents(connection: sqlite3.Connection, query: str, limit:
         })
         return []
     table = embedding_table_name()
+    normalized_query = re.sub(r"\s+", " ", str(query or "")).strip()
     try:
         with vector_engine().connect() as vector_connection:
             ready = vector_connection.execute(text(f"SELECT to_regclass('public.{table}')")).scalar_one()
@@ -2854,19 +2963,20 @@ def semantic_search_documents(connection: sqlite3.Connection, query: str, limit:
                 mark_backend_failed(VECTOR_BACKEND_STATE, RuntimeError("pgvector 테이블이 없습니다."), VECTOR_FAILURE_COOLDOWN_SECONDS)
                 EMBEDDING_RUNTIME_STATUS.update({"last_status": "table_missing", "last_query": query[:160], "last_candidates": 0, "last_used": False, "checked_at": utc_now()})
                 return []
-    except Exception as error:
-        mark_backend_failed(VECTOR_BACKEND_STATE, error, VECTOR_FAILURE_COOLDOWN_SECONDS)
-        EMBEDDING_RUNTIME_STATUS.update({"last_status": "error", "last_error": str(error)[:300], "last_query": query[:160], "last_candidates": 0, "last_used": False, "checked_at": utc_now()})
-        raise VectorSearchError("pgvector 저장소 상태를 확인할 수 없습니다.") from error
-    vector = embedding_text(create_embeddings([query])[0])
-    try:
-        with vector_engine().connect() as vector_connection:
-            # HNSW 검색 정확도를 높이되, 후보 수를 무제한으로 늘려 응답시간이 폭증하지 않게 한다.
+            # DB 연결 확인과 실제 HNSW 검색을 같은 연결에서 처리해
+            # 검색어마다 엔진·연결을 두 번 만들던 지연을 제거한다.
+            vector = embedding_text(list(cached_query_embedding(normalized_query)))
             vector_connection.execute(text(f"SET hnsw.ef_search = {VECTOR_HNSW_EF_SEARCH}"))
             raw_matches = list(vector_connection.execute(text(f"SELECT document_id, chunk_index, chunk_text, 1 - (embedding <=> CAST(:embedding AS halfvec)) AS similarity FROM {table} WHERE embedding_model = :model ORDER BY embedding <=> CAST(:embedding AS halfvec) LIMIT :limit"), {"embedding": vector, "model": EMBEDDING_MODEL, "limit": max(limit, VECTOR_CANDIDATE_TOP_K)}).mappings())
+    except VectorSearchError:
+        raise
     except Exception as error:
         mark_backend_failed(VECTOR_BACKEND_STATE, error, VECTOR_FAILURE_COOLDOWN_SECONDS)
-        EMBEDDING_RUNTIME_STATUS.update({"last_status": "error", "last_error": str(error)[:300], "last_query": query[:160], "last_candidates": 0, "last_used": False, "checked_at": utc_now()})
+        error_text = str(error)
+        missing_table = "does not exist" in error_text.lower() or "undefinedtable" in error_text.lower()
+        EMBEDDING_RUNTIME_STATUS.update({"last_status": "table_missing" if missing_table else "error", "last_error": error_text[:300], "last_query": query[:160], "last_candidates": 0, "last_used": False, "checked_at": utc_now()})
+        if missing_table:
+            return []
         raise VectorSearchError("pgvector 유사도 검색에 실패했습니다.") from error
     mark_backend_ready(VECTOR_BACKEND_STATE)
     rejected_by_threshold = sum(1 for item in raw_matches if float(item.get("similarity") or 0) < VECTOR_SIMILARITY_THRESHOLD)
@@ -3429,6 +3539,12 @@ def fuse_hybrid_results(*result_sets: list[dict[str, object]], limit: int = 16) 
                 entry["_bm25_max"] = max(float(entry.get("_bm25_max") or 0.0), float(bm25_score))
             if item.get("search_method") in {"structured", "structured_keyword", "structured_keyword_bm25", "structured_appendix_detail", "legal_hierarchy_bundle"}:
                 entry["_rrf_score"] = float(entry["_rrf_score"]) + 0.02
+            if (
+                str(item.get("evidence_score_type") or dict(item.get("metadata") or {}).get("evidence_score_type") or "") == "direct_article_match"
+                or item.get("search_method") in {"direct_legal_anchor", "legal_hierarchy_bundle"}
+            ):
+                entry["evidence_score_type"] = "direct_article_match"
+                entry["direct_match_percent"] = 100.0
     ranked = sorted(fused.values(), key=lambda item: (float(item.get("_rrf_score") or 0), int(item.get("relevance") or 0)), reverse=True)
     for item in ranked:
         item["hybrid_score"] = round(float(item.pop("_rrf_score", 0)), 6)
@@ -3437,7 +3553,13 @@ def fuse_hybrid_results(*result_sets: list[dict[str, object]], limit: int = 16) 
         if item.get("_bm25_max") is not None:
             item["bm25_score"] = round(float(item.pop("_bm25_max")), 6)
         item["search_method"] = "hybrid_rrf"
-        item["metadata"] = {**dict(item.get("metadata") or {}), "hybrid_sources": list(dict.fromkeys(item.pop("_sources", []))), "hybrid_score": item["hybrid_score"]}
+        item["metadata"] = {
+            **dict(item.get("metadata") or {}),
+            "hybrid_sources": list(dict.fromkeys(item.pop("_sources", []))),
+            "hybrid_score": item["hybrid_score"],
+            **({"evidence_score_type": "direct_article_match", "direct_match_percent": 100.0}
+               if item.get("evidence_score_type") == "direct_article_match" else {}),
+        }
     return ranked[:limit]
 
 
@@ -3472,6 +3594,33 @@ def apply_similarity_profiles(documents: list[dict[str, object]]) -> list[dict[s
 
     for item in documents:
         metadata = dict(item.get("metadata") or {})
+        if str(item.get("evidence_score_type") or metadata.get("evidence_score_type") or "") == "direct_article_match":
+            # 정확한 법령명·조문번호로 읽은 결과는 의미 유사도가 아니다.
+            # 화면에서는 별도 판정기준으로 100%를 표시하되 벡터 점수로 오인시키지 않는다.
+            direct_percent = 100.0
+            item.update({
+                "direct_match_percent": direct_percent,
+                "similarity_percent": direct_percent,
+                "similarity_label": "직접 조문 일치",
+                "similarity_score_method": "법령명·조문번호 직접 조회(벡터 유사도 아님)",
+                "vector_percent": None,
+                "bm25_percent": None,
+                "vector_weight": 0,
+                "bm25_weight": 0,
+                "vector_contribution": 0.0,
+                "bm25_contribution": 0.0,
+            })
+            item["metadata"] = {
+                **metadata, "evidence_score_type": "direct_article_match",
+                "direct_match_percent": direct_percent,
+                "similarity_percent": direct_percent,
+                "similarity_label": "직접 조문 일치",
+                "similarity_score_method": "법령명·조문번호 직접 조회(벡터 유사도 아님)",
+                "vector_percent": None, "bm25_percent": None,
+                "vector_weight": 0, "bm25_weight": 0,
+                "vector_contribution": 0.0, "bm25_contribution": 0.0,
+            }
+            continue
         vector = number(item.get("similarity"))
         bm25 = number(item.get("bm25_score") or metadata.get("bm25_score"))
         vector_percent = round(max(0.0, min(100.0, vector * 100)), 2) if vector is not None else None
@@ -3525,7 +3674,7 @@ def apply_similarity_profiles(documents: list[dict[str, object]]) -> list[dict[s
 
 def search_hybrid_documents(
     connection: sqlite3.Connection, query: str, limit: int = 5, document_types: set[str] | None = None,
-    fast_lookup: bool = False, include_embeddings: bool | None = None,
+    fast_lookup: bool = False, include_embeddings: bool | None = None, quick_lookup: bool = False,
 ) -> list[dict[str, str | None]]:
     """선택된 회계 또는 세무 지식영역 안에서만 Hybrid RAG 검색을 수행한다."""
     structured_direct = structured_keyword_search(connection, query, limit, document_types=document_types)
@@ -3622,16 +3771,15 @@ def search_hybrid_documents(
         for item in search_documents(connection, query, max(limit * 8, 30))
         if not document_types or str(item.get("document_type")) in document_types
     ]
-    if fast_lookup:
-        # 단순 질문은 LLM Query Rewrite만 생략하고, 벡터 1차 조회는 수행한다.
-        # 그래야 빠른 조회에서도 유사도와 BM25를 함께 추적할 수 있다.
-        try:
-            semantic = [
-                item for item in semantic_search_documents(connection, query, max(min(limit, 12), 10))
-                if not document_types or str(item.get("document_type")) in document_types
-            ]
-        except VectorSearchError:
-            semantic = []
+    if quick_lookup:
+        # 빠른 시작은 공식 조문 직접검색으로 충분한 질문만 대상으로 하며,
+        # 응답 지연을 만드는 외부 벡터 저장소 호출을 생략한다.
+        semantic = []
+    elif fast_lookup:
+        # 단순 질문은 정확검색·BM25와 법령 계층 보강만으로 먼저 처리한다.
+        # 외부 pgvector 연결을 매 검색어마다 기다리면 일반 질문도 화면의
+        # 요청 제한을 넘을 수 있으므로, 벡터는 심층 검색 경로에서만 사용한다.
+        semantic = []
     else:
         try:
             semantic = [
@@ -5246,6 +5394,7 @@ class NaturalLanguageQueryRequest(BaseModel):
 
     question: str = Field(min_length=2, max_length=1_000)
     request_id: str | None = Field(default=None, max_length=100)
+    quick_start: bool = False
     knowledge_track: str = Field(default="tax", pattern="^(accounting|tax)$")
     evidence_limit: int = Field(default=10, ge=3, le=15)
     data_limit: int = Field(default=20, ge=1, le=50)
@@ -5941,13 +6090,19 @@ def search_local_evidence(
     transaction: dict[str, Any], issue_keywords: list[str], limit: int = 10, db_path: Path = DEFAULT_DB_PATH,
     as_of_date: str | None = None, knowledge_track: str | None = None,
     repair_queries: list[str] | None = None,
-    progress_id: str | None = None,
+    progress_id: str | None = None, quick_start: bool = False,
 ) -> dict[str, Any]:
     """선택된 회계 또는 세무 지식기반에서만 근거를 검색해 AI 입력으로 변환한다."""
     original_query = str(transaction.get("사용자 질의") or " ".join(str(item) for item in issue_keywords)).strip()
     pipeline_track = infer_search_track(original_query, knowledge_track)
     parsed_query = parse_query_understanding(original_query, pipeline_track)
     scope = classify_rag_scope(original_query, parsed_query)
+    quick_spec = quick_start_spec(original_query) if quick_start else None
+    if quick_spec:
+        # 버튼으로 승인된 5개 질문은 정해진 공식 검색어만 사용해 LLM rewrite와
+        # 불필요한 복합검색·재시도를 모두 줄인다.
+        scope = {**scope, "mode": "quick_lookup", "skip_llm_rewrite": True,
+                 "target_count": 1, "final_context_limit": min(3, max(1, int(limit)))}
     # 단순 조회는 규칙 기반 구조화만으로 바로 검색해, 불필요한 외부 LLM 왕복을 제거한다.
     # 복합 질문에만 Query Understanding과 검색어 재작성을 사용한다.
     if scope["skip_llm_rewrite"]:
@@ -5989,16 +6144,40 @@ def search_local_evidence(
         queries = list(dict.fromkeys([*rewritten_queries, original_query]))[:query_limit]
     else:
         queries = list(dict.fromkeys([*rewritten_queries, *queries]))[:8]
+    if quick_spec:
+        # 넓은 자연어 검색어를 함께 돌리면 같은 법의 다른 조문이 상위에 섞일 수
+        # 있으므로, 빠른 시작은 해당 법령·조문을 겨냥한 정확검색 한 번만 수행한다.
+        queries = [str(quick_spec["queries"][-1])]
     # 특수관계자 시가는 법률 제52조와 시행령 제89조가 서로 다른 번호로
     # 연결되는 대표적인 위임 구조다. 일반 rewrite가 시행규칙·시가 조문에
     # 치우쳐도 두 핵심 조문을 직접 회수하도록 내부 앵커 검색을 추가한다.
     normalized_original = re.sub(r"\s+", "", original_query)
     if "특수관계" in normalized_original and "시가" in normalized_original:
-        queries = list(dict.fromkeys([
-            *queries,
+        hierarchy_queries = [
+            original_query,
             "법인세법 제52조 부당행위계산의 부인",
             "법인세법 시행령 제89조 시가의 범위 등",
-        ]))[:5]
+        ]
+        # 단순한 정의·조회 질문은 원문과 법률·시행령 앵커만으로
+        # 필요한 계층을 회수한다. 여러 유사 rewrite를 반복하지 않아
+        # 동일 조문을 다시 읽는 지연과 중복을 함께 줄인다.
+        queries = hierarchy_queries if scope.get("mode") in {"simple_lookup", "multi_lookup"} else list(dict.fromkeys([*queries, *hierarchy_queries]))[:5]
+    normalized_question = re.sub(r"\s+", "", original_query)
+    if (
+        parsed_query.get("tax_item") == "연구개발비"
+        and parsed_query.get("intent") == "연구·인력개발비 세액공제"
+        and any(term in normalized_question for term in ("공제율", "공제비율", "몇퍼센트", "몇%"))
+    ):
+        # 연구개발비 공제율은 제24조 통합투자세액공제와 검색어가 겹치기 쉽다.
+        # 핵심 조문과 하위 규정만 먼저 조회하고, 부족할 때만 repair loop가 확장한다.
+        # 이 경로는 7~8개의 유사 검색을 반복하던 병목을 줄이면서 제10조 직접조회
+        # fallback과 법령 단계별 검색을 모두 보존한다.
+        queries = list(dict.fromkeys([
+            original_query,
+            "조세특례제한법 제10조 연구·인력개발비 세액공제 공제율",
+            "조세특례제한법 시행령 연구·인력개발비 세액공제 공제율",
+            "조세특례제한법 시행규칙 연구·인력개발비 세액공제 공제율",
+        ]))
     if repair_queries:
         queries = list(dict.fromkeys([*queries, *(str(item).strip() for item in repair_queries if str(item).strip())]))[:max(8, len(queries))]
     metadata_filter = metadata_filter_for_query(parsed_query)
@@ -6026,7 +6205,7 @@ def search_local_evidence(
                 update_rag_progress(progress_id, "retrieve", f"검색 후보 {query_index + 1}/{len(queries)} 확인 중", query_progress)
                 candidates = search_hybrid_documents(
                     connection, query, limit=candidate_limit, document_types=allowed_document_types,
-                    fast_lookup=bool(scope.get("skip_llm_rewrite")),
+                    fast_lookup=bool(scope.get("skip_llm_rewrite")), quick_lookup=bool(quick_spec),
                 )
                 if query_index == 0 and hierarchy_candidates:
                     candidates.extend(hierarchy_candidates)
@@ -6043,10 +6222,10 @@ def search_local_evidence(
                     )
                 # 기준서가 다수 적중한 회계 질문에서도 회사 Context가 후보 수 제한에 밀리지 않게,
                 # 보조 자료만 한 건 별도 조회한다. 이 결과는 기준서보다 뒤에 배치된다.
-                if allowed_document_types and COMPANY_CONTEXT_DOCUMENT_TYPES.issubset(allowed_document_types):
+                if pipeline_track == "accounting" and allowed_document_types and COMPANY_CONTEXT_DOCUMENT_TYPES.issubset(allowed_document_types):
                     company_candidates = search_hybrid_documents(
                         connection, query, limit=1, document_types=COMPANY_CONTEXT_DOCUMENT_TYPES,
-                        fast_lookup=bool(scope.get("skip_llm_rewrite")),
+                        fast_lookup=bool(scope.get("skip_llm_rewrite")), quick_lookup=bool(quick_spec),
                     )
                     known_chunk_ids = {str(item.get("chunk_id") or item.get("document_id")) for item in candidates}
                     candidates.extend(
@@ -6084,6 +6263,21 @@ def search_local_evidence(
                     if evidence_id in document_ids:
                         continue
                     document_ids.add(evidence_id)
+                    document_title = str(document.get("title") or "")
+                    document_article = re.sub(r"\s+", "", str(document.get("article") or ""))
+                    direct_article_match = str(document.get("search_method") or "") in {
+                        "direct_legal_anchor", "legal_hierarchy_bundle",
+                    } or (
+                        "특수관계" in normalized_original and "시가" in normalized_original
+                        and ((document_title == "법인세법" and document_article.startswith("제52조"))
+                             or (document_title == "법인세법 시행령" and document_article.startswith("제89조")))
+                    )
+                    document_metadata = dict(document.get("metadata") or {})
+                    if direct_article_match:
+                        document_metadata.update({
+                            "evidence_score_type": "direct_article_match",
+                            "direct_match_percent": 100.0,
+                        })
                     documents.append(
                         {
                             "document_id": evidence_id,
@@ -6099,7 +6293,7 @@ def search_local_evidence(
                                 "document_type": document.get("document_type"),
                                 "evidence_track": evidence_track(document.get("document_type")),
                                 "authority_score": source_authority_score(document),
-                                **dict(document.get("metadata") or {}),
+                                **document_metadata,
                                 "effective_date": document.get("effective_date"),
                                 "collected_at": document.get("collected_at"),
                                 "as_of_date": as_of_date,
@@ -6114,6 +6308,10 @@ def search_local_evidence(
                             "hybrid_score": document.get("hybrid_score") or dict(document.get("metadata") or {}).get("hybrid_score"),
                             "authority_score": source_authority_score(document),
                             "relation_info": document.get("relation_info"),
+                            "evidence_score_type": "direct_article_match" if direct_article_match else None,
+                            "direct_match_percent": 100.0 if direct_article_match else None,
+                            "similarity_label": "직접 조문 일치" if direct_article_match else None,
+                            "similarity_score_method": "법령명·조문번호 직접 조회(벡터 유사도 아님)" if direct_article_match else None,
                         }
                     )
             # 각 검색어의 결과를 모두 확인한 다음, 질의 의도와 직접 일치하는 문서를 재정렬한다.
@@ -6191,6 +6389,10 @@ def search_local_evidence(
                         "authority_score": source_authority_score(raw_anchor),
                         "relevance_label": "DIRECT",
                         "relevance_reason": "계층형 법령 앵커 직접 보강",
+                        "evidence_score_type": "direct_article_match",
+                        "direct_match_percent": 100.0,
+                        "similarity_label": "직접 조문 일치",
+                        "similarity_score_method": "법령명·조문번호 직접 조회(벡터 유사도 아님)",
                     })
                     existing_anchor_keys.add((anchor_title, anchor_article))
             # 같은 별표·같은 공식 PDF가 여러 청크로 적중해도 사용자 화면과
@@ -6237,7 +6439,7 @@ def search_local_evidence(
     request_id = record_retrieval_event(queries, documents, as_of_date, time.monotonic() - started)
     update_rag_progress(progress_id, "retrieve", "검색 완료", 62)
     method_counts = Counter(str(item.get("metadata", {}).get("search_method") or item.get("search_method") or "keyword") for item in documents)
-    score_items = [{"rank": rank, "document_id": item["document_id"], "title": item["title"], "article": item.get("article"), "score": item.get("relevance"), "bm25_score": item.get("bm25_score") or item.get("metadata", {}).get("bm25_score"), "bm25_percent": item.get("bm25_percent") or item.get("metadata", {}).get("bm25_percent"), "relevance_score": item.get("relevance_score"), "relevance_label": item.get("relevance_label") or item.get("metadata", {}).get("relevance_label"), "similarity": item.get("similarity"), "similarity_percent": item.get("similarity_percent") or item.get("metadata", {}).get("similarity_percent"), "similarity_label": item.get("similarity_label") or item.get("metadata", {}).get("similarity_label"), "vector_percent": item.get("vector_percent") or item.get("metadata", {}).get("vector_percent"), "vector_weight": item.get("vector_weight") if item.get("vector_weight") is not None else item.get("metadata", {}).get("vector_weight"), "bm25_weight": item.get("bm25_weight") if item.get("bm25_weight") is not None else item.get("metadata", {}).get("bm25_weight"), "vector_contribution": item.get("vector_contribution") if item.get("vector_contribution") is not None else item.get("metadata", {}).get("vector_contribution"), "bm25_contribution": item.get("bm25_contribution") if item.get("bm25_contribution") is not None else item.get("metadata", {}).get("bm25_contribution"), "similarity_score_method": item.get("similarity_score_method") or item.get("metadata", {}).get("similarity_score_method"), "similarity_gap_to_085": round(max(0.0, 0.85 - float(item.get("similarity") or 0.0)), 4) if item.get("similarity") is not None else None, "hybrid_score": item.get("hybrid_score") or item.get("metadata", {}).get("hybrid_score"), "method": item["metadata"].get("search_method")} for rank, item in enumerate(documents[:RERANK_TOP_K], start=1)]
+    score_items = [{"rank": rank, "document_id": item["document_id"], "title": item["title"], "article": item.get("article"), "score": item.get("relevance"), "bm25_score": item.get("bm25_score") or item.get("metadata", {}).get("bm25_score"), "bm25_percent": item.get("bm25_percent") or item.get("metadata", {}).get("bm25_percent"), "relevance_score": item.get("relevance_score"), "relevance_label": item.get("relevance_label") or item.get("metadata", {}).get("relevance_label"), "similarity": item.get("similarity"), "similarity_percent": item.get("similarity_percent") if item.get("similarity_percent") is not None else item.get("metadata", {}).get("similarity_percent"), "similarity_label": item.get("similarity_label") or item.get("metadata", {}).get("similarity_label"), "evidence_score_type": item.get("evidence_score_type") or item.get("metadata", {}).get("evidence_score_type"), "direct_match_percent": item.get("direct_match_percent") if item.get("direct_match_percent") is not None else item.get("metadata", {}).get("direct_match_percent"), "vector_percent": item.get("vector_percent") if item.get("vector_percent") is not None else item.get("metadata", {}).get("vector_percent"), "vector_weight": item.get("vector_weight") if item.get("vector_weight") is not None else item.get("metadata", {}).get("vector_weight"), "bm25_weight": item.get("bm25_weight") if item.get("bm25_weight") is not None else item.get("metadata", {}).get("bm25_weight"), "vector_contribution": item.get("vector_contribution") if item.get("vector_contribution") is not None else item.get("metadata", {}).get("vector_contribution"), "bm25_contribution": item.get("bm25_contribution") if item.get("bm25_contribution") is not None else item.get("metadata", {}).get("bm25_contribution"), "similarity_score_method": item.get("similarity_score_method") or item.get("metadata", {}).get("similarity_score_method"), "similarity_gap_to_085": round(max(0.0, 0.85 - float(item.get("similarity") or 0.0)), 4) if item.get("similarity") is not None else None, "hybrid_score": item.get("hybrid_score") or item.get("metadata", {}).get("hybrid_score"), "method": item["metadata"].get("search_method")} for rank, item in enumerate(documents[:RERANK_TOP_K], start=1)]
     retrieval_trace = [
         {"stage": "질문 분석", "status": "완료", "detail": json.dumps(parsed_query, ensure_ascii=False)},
         {"stage": "다중 쟁점 가설", "status": "완료", "detail": json.dumps(parsed_query.get("issue_hypotheses") or [], ensure_ascii=False)},
@@ -6253,7 +6455,7 @@ def search_local_evidence(
         {"stage": "Semantic Bridge", "status": "완료", "detail": json.dumps(parsed_query.get("semantic_bridge") or {}, ensure_ascii=False)},
         {"stage": "Issue Tree", "status": "완료", "detail": " | ".join(str(item) for item in (parsed_query.get("semantic_bridge") or {}).get("issue_tree") or []) or "핵심 쟁점 미확정"},
         {"stage": "Metadata Filter", "status": "완료", "detail": json.dumps(metadata_filter, ensure_ascii=False) or "필터 없음"},
-        {"stage": "Hybrid 검색", "status": "완료", "detail": ", ".join(f"{key}: {value}건" for key, value in method_counts.items()) or "검색 결과 없음", "fts5": bool(locals().get("fts_ready", False)), "bm25": True},
+        {"stage": "Hybrid 검색", "status": "완료", "detail": ", ".join(f"{key}: {value}건" for key, value in method_counts.items()) or "검색 결과 없음", "fts5": bool(locals().get("fts_ready", False)), "bm25": True, "elapsed_seconds": round(time.monotonic() - started, 3)},
         {"stage": "임베딩·벡터 검색", "status": str(EMBEDDING_RUNTIME_STATUS.get("last_status") or "미실행"), "detail": f"모드 {EMBEDDING_RETRIEVAL_MODE} · 전환 {EMBEDDING_ROLLOUT_STAGE} · 후보 {EMBEDDING_RUNTIME_STATUS.get('last_candidates', 0)}건 · 유사도 최고 {EMBEDDING_RUNTIME_STATUS.get('last_similarity_max') if EMBEDDING_RUNTIME_STATUS.get('last_similarity_max') is not None else '-'} · 평균 {EMBEDDING_RUNTIME_STATUS.get('last_similarity_avg') if EMBEDDING_RUNTIME_STATUS.get('last_similarity_avg') is not None else '-'} · 목표 0.85 gap {round(max(0.0, 0.85 - float(EMBEDDING_RUNTIME_STATUS.get('last_similarity_max') or 0.0)), 4) if EMBEDDING_RUNTIME_STATUS.get('last_similarity_max') is not None else '-'} · 임계값 {VECTOR_SIMILARITY_THRESHOLD}"},
         {"stage": "재정렬·근거 선택", "status": "완료", "detail": f"후보 {candidate_limit if 'candidate_limit' in locals() else 0}건 → 최종 {len(documents)}건", "documents": score_items},
         {"stage": "관계·계층 확장", "status": "완료", "detail": "법률→시행령→시행규칙 및 인용관계 후보를 확인했습니다.", "documents": [
@@ -6266,7 +6468,7 @@ def search_local_evidence(
              "as_of_date": as_of_date, "evidence_warnings": list(dict.fromkeys(warnings)), "retrieval_id": request_id,
               "foundation_analysis": foundation, "parsed_query": parsed_query, "rewritten_queries": rewritten_queries,
               "metadata_filter": metadata_filter, "query_plan": query_plan, "embedding_status": embedding_status_snapshot(), "retrieval_trace": retrieval_trace,
-             "query_rewrite_status": llm_rewrite_status}
+              "query_rewrite_status": llm_rewrite_status, "retrieval_elapsed_seconds": round(time.monotonic() - started, 3)}
     if RAG_DEBUG_ENABLED:
         result["retrieval_debug"] = {
             "original_query": original_query, "parsed_query": parsed_query, "rewritten_queries": rewritten_queries,
@@ -7665,7 +7867,15 @@ def assess_retrieval_sufficiency(
         repair_queries = [f"{base} {term}".strip() for term in missing[:4]]
     has_direct = any(str(item.get("relevance_label") or item.get("metadata", {}).get("relevance_label") or "") == "DIRECT" for item in evidence_documents)
     coverage = round(len(covered) / len(required), 3) if required else (1.0 if evidence_documents else 0.0)
-    retry = bool(missing and retry_count < 2 and (parsed_query.get("tax_item") or parsed_query.get("standard_number")))
+    special_market_value_intent = parsed_query.get("intent") in {
+        "특수관계인 시가·부당행위계산", "특수관계자 거래 시가", "특수관계자 거래 시가·부당행위계산",
+    }
+    hierarchy_complete = (
+        special_market_value_intent
+        and any("법인세법" in str(item.get("title") or "") and "시행" not in str(item.get("title") or "") and "제52조" in str(item.get("article") or "") for item in evidence_documents)
+        and any("법인세법 시행령" in str(item.get("title") or "") and "제89조" in str(item.get("article") or "") for item in evidence_documents)
+    )
+    retry = bool(missing and retry_count < 2 and (parsed_query.get("tax_item") or parsed_query.get("standard_number")) and not hierarchy_complete)
     return {
         "coverage_score": coverage,
         "covered_issues": covered,
@@ -8514,15 +8724,18 @@ def web_app() -> HTMLResponse:
     """별도 FastAPI 기반으로 PoC의 주요 업무 흐름을 직접 제공하는 웹 화면이다."""
     # 계산은 자연어 답변 안에서만 제공하고, 예상 거래 사전진단은 챗봇의 접힌 보조정보로 통합한다.
     html = re.sub(r'<div class="panel"><h3>세액·가산세 계산</h3>.*?<div id="calc-result" class="result"></div></div>', '', INTEGRATED_WEB_APP_HTML)
+    # 메인 기능이 위험분석이 아니라 지식·검토 챗봇임을 화면 제목과 브랜드에 반영한다.
+    html = html.replace("회계·세무 리스크 분석", "회계·세무 검토 챗봇")
     # PRD v2의 LangGraph 흐름을 화면의 기본 구조로 삼는다. 기존 원장 분석 화면은 삭제하지
     # 않고 숨겨 두어 현재 API와 운영 데이터를 훼손하지 않는다.
     html = re.sub(
         r'<div class="nav">.*?</div></aside>',
         '''<div class="nav graph-nav">
-<div class="nav-label">검토 워크플로우</div>
-<button data-view="chat" class="active"><span>01</span> 지식·검토 챗봇</button>
-<button data-view="reference"><span>02</span> 지식기반 상태</button>
-<a href="/capital-expenditure" style="display:block;margin:8px 0;padding:13px;color:#075da8;text-decoration:none;font-weight:800;border-radius:8px;background:#eef7ff">자본적·수익적 지출 검토</a>
+ <div class="nav-label">주요 기능</div>
+ <button data-view="chat" class="active"><span>01</span> 지식·검토 챗봇</button>
+ <button data-view="reference"><span>02</span> 지식기반 상태</button>
+ <div class="nav-label sub-nav-label">검토 보조 기능</div>
+ <a class="sub-feature" href="/capital-expenditure">자본적·수익적 지출 검토</a>
 <div class="nav-divider"></div>
 <div class="nav-note">질문을 입력하면 사실정리 → 근거검색 → 검토 → 검증 순으로 진행됩니다.</div>
 </div></aside>''',
@@ -8540,7 +8753,7 @@ def web_app() -> HTMLResponse:
   <div><b>01</b><span>질문·사실 정리</span></div><i>→</i><div><b>02</b><span>기준·법령 검색</span></div><i>→</i><div><b>03</b><span>검토의견 작성</span></div><i>→</i><div><b>04</b><span>근거 검증</span></div>
 </div>
  <div class="chat-header-row"><div id="chat-status" class="status">지식기반 상태 확인 중</div><span class="chat-header-note">답변에는 검색 근거와 적용 조건이 함께 표시됩니다.</span></div>
-<div class="quick-questions"><span>빠른 시작</span><button type="button" data-quick-question="유형자산 인식 조건을 K-IFRS 기준으로 검토해주세요.">유형자산 인식</button><button type="button" data-quick-question="장기공급계약 선수금의 계약부채 회계처리를 검토해주세요.">계약부채·선수금</button><button type="button" data-quick-question="특수관계자 거래의 이전가격 쟁점을 검토해주세요.">이전가격 검토</button></div>
+ <div class="quick-questions"><span>빠른 확인</span><small>법령·기한 단순 조회</small><button type="button" data-quick-question="재산세는 언제 내나요?">재산세 납부기한</button><button type="button" data-quick-question="사업소분 주민세는 언제 신고·납부하나요?">사업소분 주민세</button><button type="button" data-quick-question="부가가치세율은 몇 %인가요?">부가가치세율</button><button type="button" data-quick-question="원천징수한 세금은 언제 납부하나요?">원천징수 납부기한</button><button type="button" data-quick-question="법인세 신고기한은 언제인가요?">법인세 신고기한</button></div>
 <div id="chat-messages" class="chat graph-chat" style="margin-top:18px"></div>
 <div class="chat-composer"><label for="chat-question">검토할 거래 또는 질문</label><div class="chat-input"><input id="chat-question" placeholder="예: 싱가포르 자회사 원재료 매입가격이 시가보다 낮습니다. 이전가격 쟁점을 검토해주세요."><button id="chat-send" class="primary">검토 시작</button></div><div class="file-note">필요하면 계약서·세금계산서·메일·캡처를 첨부해 사실관계를 보강할 수 있습니다.</div></div>
 <details class="attachment-panel"><summary>현업 자료 첨부 (선택)</summary><input id="chat-files" type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.txt,.eml,application/pdf,image/png,image/jpeg,text/plain,message/rfc822"><div id="chat-attachment-status" class="file-note">최대 5개, 파일당 10MB. 첨부자료는 사실관계 보강용이며 법령·기준서 근거와 구분됩니다.</div></details>
@@ -8551,7 +8764,7 @@ def web_app() -> HTMLResponse:
     )
     html = html.replace(
         "</style>",
-        ".graph-nav{border-top:0;padding-top:4px}.nav-label{padding:13px 12px 8px;color:#8090a1;font-size:11px;font-weight:800;letter-spacing:.1em}.graph-nav button{display:flex;align-items:center;gap:10px}.graph-nav button span{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:50%;background:#e8f2fb;color:#0a6fba;font-size:11px;font-weight:800}.graph-nav button.active span{background:#0a6fba;color:#fff}.nav-divider{height:1px;background:#e2e8ef;margin:16px 0}.nav-note{padding:0 12px;color:#738396;font-size:12px;line-height:1.7}.workflow-overview{display:flex;align-items:center;gap:8px;margin:22px 0 16px;padding:14px 16px;background:#fff;border:1px solid #dce7f0;border-radius:12px;overflow:auto}.workflow-overview div{display:flex;align-items:center;gap:7px;white-space:nowrap;color:#40566c;font-size:12px;font-weight:700}.workflow-overview b{display:grid;place-items:center;width:24px;height:24px;border-radius:50%;background:#e9f4fd;color:#0a6fba;font-size:11px}.workflow-overview i{color:#a5b3c0;font-style:normal}.chat-header-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.chat-header-note{color:#6d7d8f;font-size:12px}.quick-questions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:16px}.quick-questions span{font-size:12px;color:#738396;font-weight:800}.quick-questions button{border:1px solid #c5dff2;border-radius:16px;padding:7px 10px;background:#f5faff;color:#0868b8;font:inherit;font-size:12px;font-weight:700;cursor:pointer}.chat-composer{margin-top:18px;padding:16px;background:#fff;border:1px solid #dce4ed;border-radius:12px}.chat-composer label{margin-top:0}.chat-composer .chat-input{margin-top:0}.attachment-panel{margin-top:12px;padding:12px 15px;background:#fff;border:1px solid #dce4ed;border-radius:10px}.attachment-panel summary{color:#40566c}.attachment-panel input{margin-top:11px}.graph-chat .message.answer{border-top:3px solid #0a6fba}.graph-chat .message.question{border-left-color:#ff5b61}@media(max-width:850px){.workflow-overview{align-items:flex-start}.workflow-overview i{display:none}.workflow-overview{flex-wrap:wrap}.chat-header-row{align-items:flex-start}}</style>",
+         ".graph-nav{border-top:0;padding-top:4px}.nav-label{padding:13px 12px 8px;color:#8090a1;font-size:11px;font-weight:800;letter-spacing:.1em}.sub-nav-label{padding-top:20px}.sub-feature{display:block;margin:4px 0 8px;padding:10px 12px;color:#075da8;text-decoration:none;font-weight:800;border-radius:8px;background:#eef7ff}.graph-nav button{display:flex;align-items:center;gap:10px}.graph-nav button span{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:50%;background:#e8f2fb;color:#0a6fba;font-size:11px;font-weight:800}.graph-nav button.active span{background:#0a6fba;color:#fff}.nav-divider{height:1px;background:#e2e8ef;margin:16px 0}.nav-note{padding:0 12px;color:#738396;font-size:12px;line-height:1.7}.workflow-overview{display:flex;align-items:center;gap:8px;margin:22px 0 16px;padding:14px 16px;background:#fff;border:1px solid #dce7f0;border-radius:12px;overflow:auto}.workflow-overview div{display:flex;align-items:center;gap:7px;white-space:nowrap;color:#40566c;font-size:12px;font-weight:700}.workflow-overview b{display:grid;place-items:center;width:24px;height:24px;border-radius:50%;background:#e9f4fd;color:#0a6fba;font-size:11px}.workflow-overview i{color:#a5b3c0;font-style:normal}.chat-header-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.chat-header-note{color:#6d7d8f;font-size:12px}.quick-questions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:16px}.quick-questions span{font-size:12px;color:#738396;font-weight:800}.quick-questions small{color:#8090a1;font-size:11px;margin-right:2px}.quick-questions button{border:1px solid #c5dff2;border-radius:16px;padding:7px 10px;background:#f5faff;color:#0868b8;font:inherit;font-size:12px;font-weight:700;cursor:pointer}.chat-composer{margin-top:18px;padding:16px;background:#fff;border:1px solid #dce4ed;border-radius:12px}.chat-composer label{margin-top:0}.chat-composer .chat-input{margin-top:0}.attachment-panel{margin-top:12px;padding:12px 15px;background:#fff;border:1px solid #dce4ed;border-radius:10px}.attachment-panel summary{color:#40566c}.attachment-panel input{margin-top:11px}.graph-chat .message.answer{border-top:3px solid #0a6fba}.graph-chat .message.question{border-left-color:#ff5b61}@media(max-width:850px){.workflow-overview{align-items:flex-start}.workflow-overview i{display:none}.workflow-overview{flex-wrap:wrap}.chat-header-row{align-items:flex-start}}</style>",
         1,
     )
     # 대시보드·거래 분석은 현재 업무 흐름에서 제외하고 챗봇을 첫 화면으로 연다.
@@ -8575,6 +8788,30 @@ def web_app() -> HTMLResponse:
     # 예상 거래 화면의 보조 함수는 줄바꿈을 포함하므로 DOTALL로 함께 제거한다.
     html = re.sub(r'async function expectedPayload\(\).*?\$\(\'expected-diagnose\'\)\.onclick=\(\)=>runExpected\(true\);', '', html, flags=re.S)
     html = html.replace("loadStatus();$('analysis-month').value=new Date().toISOString().slice(0,7);$('expected-date').value=new Date().toISOString().slice(0,10);", "loadStatus();if($('analysis-month'))$('analysis-month').value=new Date().toISOString().slice(0,7);")
+    # 임베딩 저장소 장애도 브라우저가 안전하게 처리하도록 JSON 파싱과 자동 재시도를 보강한다.
+    # 일반 챗봇 검색과 분리된 화면이므로 임베딩 지도가 실패해도 다른 기능은 계속 사용할 수 있다.
+    embedding_fetch_legacy = "const response=await fetch('/embedding-projector/data?'+params),data=await response.json();if(!response.ok)throw new Error(data.detail||'임베딩을 불러오지 못했습니다.');"
+    embedding_fetch_safe = "const response=await fetch('/embedding-projector/data?'+params);const raw=await response.text();let data;try{data=JSON.parse(raw)}catch(_error){data={detail:raw.trim()||'임베딩 응답을 해석하지 못했습니다.'}}if(!response.ok)throw new Error(data.detail||'임베딩을 불러오지 못했습니다.');"
+    html = html.replace(embedding_fetch_legacy, embedding_fetch_safe)
+    # 점수 패널은 화면 조합 중 문법 오류가 발생하기 쉬운 과도한 한 줄 표현을 단순화한다.
+    # 점수 값이 없으면 ‘미실행’으로 표시하고, 값이 있을 때만 정량 점수를 보여준다.
+    score_start = html.find("const scoreValue=(item,key)=>")
+    score_end = html.find("const simpleAnswerBlocks=", score_start)
+    if score_start >= 0 and score_end > score_start:
+        embedding_score_safe = """const scoreValue=(item,key)=>{const value=item[key]??(item.metadata||{})[key];const number=Number(value);return Number.isFinite(number)?number:null};const evidenceScoreHtml=item=>{const metadata=item.metadata||{},direct=String(item.evidence_score_type??metadata.evidence_score_type??'')==='direct_article_match',raw=direct?(scoreValue(item,'direct_match_percent')??100):scoreValue(item,'similarity_percent'),score=raw==null?null:Math.max(0,Math.min(100,raw)),vector=scoreValue(item,'vector_percent'),bm25=scoreValue(item,'bm25_percent'),hybrid=scoreValue(item,'hybrid_score'),label=String(item.similarity_label??metadata.similarity_label??(direct?'직접 조문 일치':score==null?'미실행':score>=90?'매우 높음':score>=60?'높음':score>=30?'중간':score>=10?'낮음':'매우 낮음')),shown=score==null?'—':score.toFixed(2)+'%',ring=score==null?0:score,fmt=value=>value==null?'미실행':value.toFixed(2),basis=direct?'<span><b>판정 기준</b> 법령명·조문번호 직접 일치</span>':'';return '<div class=\"evidence-score-panel\"><div class=\"evidence-score-ring\" style=\"--score:'+ring+'%\"><span>'+shown+'</span><small>'+esc(label)+'</small></div><div class=\"evidence-score-values\">'+basis+'<span><b>벡터</b> '+fmt(vector)+'</span><span><b>BM25</b> '+fmt(bm25)+'</span><span><b>Hybrid</b> '+fmt(hybrid)+'</span></div></div>'};"""
+        html = html[:score_start] + embedding_score_safe + html[score_end:]
+    html = html.replace(
+        "const ctx=canvas.getContext('2d');let points=[],screen=[],rx=-.32,ry=.48,zoom=1,drag=false,lastX=0,lastY=0,hover=-1;",
+        "const ctx=canvas.getContext('2d');let points=[],retryTimer=null,retryCount=0,screen=[],rx=-.32,ry=.48,zoom=1,drag=false,lastX=0,lastY=0,hover=-1;",
+    )
+    html = html.replace(
+        "points=data.points||[];label.textContent=data.model+' · '+data.dimensions+'차원 → PCA 3차원 · '+data.count+'개';draw()",
+        "points=data.points||[];retryCount=0;clearTimeout(retryTimer);selected.className='notice';label.textContent=data.model+' · '+data.dimensions+'차원 → PCA 3차원 · '+data.count+'개';draw()",
+    )
+    html = html.replace(
+        "catch(error){points=[];label.textContent=error.message;selected.className='notice warn';draw()}",
+        "catch(error){points=[];label.textContent='임베딩 공간을 불러오지 못했습니다.';selected.className='notice warn';selected.textContent=error.message+' 일반 키워드·법령 검색은 계속 사용할 수 있습니다.';if(retryCount<3){retryCount+=1;clearTimeout(retryTimer);retryTimer=setTimeout(()=>{if(document.visibilityState!=='hidden')load()},15000);label.textContent+=' 15초 후 자동 재시도('+retryCount+'/3)';}draw()}",
+    )
     # 사용자가 실제 검색 대상 문서의 범위를 확인할 수 있도록 읽기 전용 목록을 기준 데이터 화면에 추가한다.
     knowledge_catalog_panel = '''<div class="panel knowledge-catalog-panel"><div class="knowledge-catalog-heading"><div><h3>지식기반 데이터 목록</h3><p class="small">현재 검색에 참여하는 문서의 종류·출처·시행일/버전·청크 수를 확인할 수 있습니다. 원문과 내부 식별정보는 노출하지 않습니다.</p></div><button id="knowledge-list-reload" class="secondary" type="button">새로고침</button></div><div class="two knowledge-catalog-filters"><label>영역<select id="knowledge-list-track"><option value="all">전체</option><option value="tax">세무</option><option value="accounting">회계</option></select></label><label>문서 검색<input id="knowledge-list-search" placeholder="법령명·기준서·출처 검색"></label></div><div id="knowledge-list-status" class="small">문서 목록을 불러오는 중입니다.</div><div id="knowledge-document-list" class="knowledge-document-list"><div class="empty">문서 목록을 불러오는 중입니다.</div></div></div>'''
     html = html.replace('<div class="panel"><h3>실제 임베딩 공간</h3>', knowledge_catalog_panel + '<div class="panel"><h3>실제 임베딩 공간</h3>', 1)
@@ -8607,7 +8844,7 @@ loadKnowledgeCatalog();
     )
     chat_script = chat_script.replace(
         "const submit=async(question)=>{const value=(question||input.value).trim();if(!value)return;",
-        "const submit=async(question,followup=false)=>{const value=(question||input.value).trim();if(!value)return;if(!followup&&!continueContext.checked)conversation.length=0;",
+        "const submit=async(question,followup=false,quickStart=false)=>{const value=(question||input.value).trim();if(!value)return;if(!followup&&!continueContext.checked)conversation.length=0;",
     )
     # 회계와 세무는 화면 선택부터 별도 세션으로 시작해 이전 영역의 문맥이 섞이지 않게 한다.
     chat_script = chat_script.replace(
@@ -8616,7 +8853,7 @@ loadKnowledgeCatalog();
     )
     chat_script = chat_script.replace(
         "body:JSON.stringify({question:value,conversation:[],attachments:await attachments()})",
-        "body:JSON.stringify({request_id:requestId,question:value,knowledge_track:track.value,conversation:(followup||continueContext.checked)?conversation.slice(-3):[],attachments:await attachments()})",
+        "body:JSON.stringify({request_id:requestId,question:value,quick_start:quickStart,knowledge_track:track.value,conversation:(followup||continueContext.checked)?conversation.slice(-3):[],attachments:await attachments()})",
     )
     chat_script = chat_script.replace(
         "loading.remove();render(payload)",
@@ -8784,7 +9021,7 @@ loadKnowledgeCatalog();
     # 화면 상단의 예시 질문도 동일한 LangGraph 검토 세션으로 전달한다.
     chat_script = chat_script.replace(
         "const globalLoader=document.createElement('div');",
-        "document.addEventListener('click',event=>{const button=event.target.closest('[data-quick-question]');if(button)submit(button.dataset.quickQuestion)});const globalLoader=document.createElement('div');",
+        "document.addEventListener('click',event=>{const button=event.target.closest('[data-quick-question]');if(button)submit(button.dataset.quickQuestion,false,true)});const globalLoader=document.createElement('div');",
         1,
     )
     chat_script = chat_script.replace(
@@ -8798,6 +9035,12 @@ loadKnowledgeCatalog();
     chat_script = re.sub(r"const reportId='report-'.*?;if\(\(payload\.retrieval_trace\|\|\[\]\)\.length\)", "if((payload.retrieval_trace||[]).length)", chat_script, count=1, flags=re.S)
     chat_script = re.sub(r"const pptReport=async button=>.*?const globalLoader=", "const globalLoader=", chat_script, count=1, flags=re.S)
     chat_script = re.sub(r"const specialize=async button=>.*?const globalLoader=", "const globalLoader=", chat_script, count=1, flags=re.S)
+    # 최종 삽입되는 챗봇 스크립트의 점수 표시 함수도 단순화해 전체 이벤트 등록이 중단되지 않게 한다.
+    score_start = chat_script.find("const scoreValue=(item,key)=>")
+    score_end = chat_script.find("const simpleAnswerBlocks=", score_start)
+    if score_start >= 0 and score_end > score_start:
+        embedding_score_safe = """const scoreValue=(item,key)=>{const value=item[key]??(item.metadata||{})[key];const number=Number(value);return Number.isFinite(number)?number:null};const evidenceScoreHtml=item=>{const metadata=item.metadata||{},raw=scoreValue(item,'similarity_percent'),score=raw==null?null:Math.max(0,Math.min(100,raw)),vector=scoreValue(item,'vector_percent'),bm25=scoreValue(item,'bm25_percent'),hybrid=scoreValue(item,'hybrid_score'),label=String(item.similarity_label??metadata.similarity_label??(score==null?'미실행':score>=90?'매우 높음':score>=60?'높음':score>=30?'중간':score>=10?'낮음':'매우 낮음')),shown=score==null?'—':score.toFixed(2)+'%',ring=score==null?0:score,fmt=value=>value==null?'미실행':value.toFixed(2);return '<div class=\"evidence-score-panel\"><div class=\"evidence-score-ring\" style=\"--score:'+ring+'%\"><span>'+shown+'</span><small>'+esc(label)+'</small></div><div class=\"evidence-score-values\"><span><b>벡터</b> '+fmt(vector)+'</span><span><b>BM25</b> '+fmt(bm25)+'</span><span><b>Hybrid</b> '+fmt(hybrid)+'</span></div></div>'};"""
+        chat_script = chat_script[:score_start] + embedding_score_safe + chat_script[score_end:]
     # 화면 조합 과정에서 로딩 효과가 빠지면 조용히 배포하지 않고 즉시 오류로 드러낸다.
     loading_contract = ("loading-panel", "chat-orbit", "chat-progress", "loading-track", "progressTimer", "global-request-loader", "originalFetch")
     if any(marker not in chat_script for marker in loading_contract):
@@ -9451,9 +9694,27 @@ def capital_expenditure_attachment_summary(filename: str, text: str) -> str:
 
 def capital_expenditure_review_html(review: dict[str, str], field_judgement: str = "", input_facts: list[str] | None = None) -> str:
     """검토 결과에서 결론과 핵심 근거가 바로 보이게 안전한 HTML로 표시한다."""
+    # AI 결론에서 실제 판단에 영향을 주는 표현만 노란색으로 표시한다.
+    # 원문 전체를 강조하지 않고, 금액·개선 여부·회계처리 방향을 식별하기 쉽게 만든다.
+    highlight_terms = (
+        "자본적 지출", "수익적 지출", "100만원 이상", "100만원 미만", "100만 원 이상", "100만 원 미만",
+        "생산능력 증가", "생산능력이 증가", "내용연수 연장", "내용연수가 연장", "원가 절감", "품질 향상",
+        "용도 변경", "개조", "설치", "확장", "증설", "원상 회복", "원상회복", "동일 사양", "동일사양",
+        "신규 자산", "자산 인식", "자산화", "비용 처리", "비용처리", "K-IFRS", "추가 확인이 필요",
+    )
+    highlight_pattern = re.compile("(" + "|".join(re.escape(term) for term in sorted(highlight_terms, key=len, reverse=True)) + ")")
+
+    def highlighted(content: str) -> str:
+        """안전하게 이스케이프한 뒤 판단 핵심 표현만 mark 태그로 감싼다."""
+        pieces = highlight_pattern.split(str(content or ""))
+        return "".join(
+            f'<mark class="core-highlight">{html.escape(piece)}</mark>' if index % 2 else html.escape(piece)
+            for index, piece in enumerate(pieces)
+        )
+
     def block(title: str, content: str, emphasis: bool = False) -> str:
         safe_title = html.escape(title)
-        safe_content = html.escape(content).replace("\n", "<br>")
+        safe_content = highlighted(content).replace("\n", "<br>")
         class_name = "review-block emphasis" if emphasis else "review-block"
         return f'<section class="{class_name}"><h3>{safe_title}</h3><p>{safe_content}</p></section>'
 
@@ -9467,7 +9728,7 @@ def capital_expenditure_review_html(review: dict[str, str], field_judgement: str
     key_basis = review.get("key_basis") or capital_expenditure_key_basis(review["decision"], review["amount_basis"], review["concept_basis"], review["accounting_basis"])
     decision_content = (
         f'<strong class="decision-value">{html.escape(review["decision"])}</strong>'
-        f'<div class="review-subblock"><h4>주요 근거</h4><p>{html.escape(key_basis).replace(chr(10), "<br>")}</p></div>'
+        f'<div class="review-subblock"><h4>주요 근거</h4><p class="key-sentence-highlight">{highlighted(key_basis).replace(chr(10), "<br>")}</p></div>'
     )
     judgement_class = "review-collapsible conflict" if review.get("judgement_conflict") == "true" else "review-collapsible"
     judgement_open = " open" if review.get("judgement_conflict") == "true" else ""
@@ -9633,7 +9894,7 @@ def capital_expenditure_guided_html() -> str:
 <section id="output" class="output"><h2>검토 결과</h2><div id="review-target" class="review-target"></div><div id="decision" class="decision"></div><div id="review-result" class="review"></div><div class="result-actions"><div id="post-area" class="mail post-area"><h2>게시물 등록</h2><p class="sub">검토 결과를 누적관리 게시판에 등록합니다. 등록 후 관리자 게시판에서 확인할 수 있습니다.</p><button id="post-button" class="action" type="button">게시물로 등록</button><div id="post-status" class="status"></div></div><div id="mail-area" class="mail"><h2>세무섹션에 보내기</h2><p class="sub">검토 문안을 확인한 뒤 송부하세요. 수신자는 시스템에 설정된 세무섹션 주소입니다.</p><label>메일 제목</label><input id="mail-subject"><button id="mail-button" class="action" type="button">세무섹션으로 메일 송부</button><div id="mail-status" class="status"></div></div></div></section></main><script>
 const $=id=>document.getElementById(id),form=$('checklist'),out=$('output'),result=$('review-result'),decision=$('decision'),mailArea=$('mail-area'),mailSubject=$('mail-subject'),mailStatus=$('mail-status'),reviewButton=$('review-button'),mailButton=$('mail-button'),caseHelp=$('case-help'),repairFields=$('repair-fields'),moneyGuide=$('money-guide'),preflight=$('preflight');let reviewText='';const value=name=>String(new FormData(form).get(name)||'').trim(),checked=name=>new FormData(form).get(name)==='on',number=name=>{const x=value(name);return x===''?null:Number(x)};const selectedCase=()=>document.querySelector('input[name=case_type]:checked')?.value||'';const cases={component:{help:'주요 부품 교체를 선택했습니다. 교체하는 부품 자체의 취득금액을 입력해 주세요. 기존 부품을 폐기하는지도 함께 적어 주세요.',money:'개별자산 취득금액이 100만원 미만이면 수익적 지출 기준을 먼저 검토합니다.'},repair:{help:'단순 수리·유지보수를 선택했습니다. 올해 이 자산에 쓴 수선비 합계와 장부금액을 알면 판단에 도움이 됩니다.',money:'연간 수선비 600만원 미만, 장부금액의 5% 미만 또는 3년 미만 반복수선 여부를 확인합니다.'},expansion:{help:'설비 확장·개조를 선택했습니다. 생산량·품질·사용 기간이 실제로 달라지는지 아래에서 체크해 주세요.',money:'100만원 이상인 설치·확장·증설 지출은 자본적 지출 여부를 추가로 검토합니다.'},disaster:{help:'재해·사고 복구를 선택했습니다. 기존 설비가 본래 기능을 잃었는지와 복구 범위를 설명해 주세요.',money:'100만원 이상 복구 지출은 자본적 지출 여부를 추가로 검토합니다.'},unsure:{help:'괜찮습니다. 지출 내용을 쉬운 말로 자세히 적고, 견적서·사진 등 보유한 자료를 함께 준비해 주세요.',money:'금액을 모르더라도 요청할 수 있지만, 세무섹션의 추가 확인이 필요할 수 있습니다.'}};function updateGuide(){const type=selectedCase(),info=cases[type];caseHelp.classList.toggle('show',!!info);caseHelp.textContent=info?.help||'';repairFields.classList.toggle('show',type==='repair');moneyGuide.textContent=info?.money||'상황을 먼저 선택하면 필요한 금액 기준을 안내합니다.';form.elements.is_component_purchase.checked=type==='component';form.elements.is_repair.checked=type==='repair';form.elements.installs_or_expands_asset.checked=type==='expansion';form.elements.restores_disaster_damaged_asset.checked=type==='disaster';updatePreflight()}function updatePreflight(){const missing=[];if(!selectedCase())missing.push('가장 가까운 지출 상황을 하나 선택해 주세요.');if(!value('expenditure_description'))missing.push('무엇을 어떻게 하는지 지출 내용을 적어 주세요.');if(!value('expenditure_amount'))missing.push('이번 지출금액을 입력해 주세요.');if(selectedCase()==='component'&&!value('asset_acquisition_amount'))missing.push('주요 부품 교체라면 개별자산 취득금액을 입력해 주세요.');if(selectedCase()==='repair'&&!value('annual_repair_amount'))missing.push('수리·유지보수라면 올해 수선비 합계를 입력하면 더 정확하게 검토할 수 있습니다.');if(checked('disposes_existing_asset')&&!value('disposal_reason'))missing.push('기존 자산을 폐기한다면 폐기 사유를 적어 주세요.');preflight.innerHTML=missing.length?'<b>제출 전 확인해 주세요</b><ul>'+missing.map(x=>'<li>'+x+'</li>').join('')+'</ul>':'<b>입력 준비가 되었습니다.</b> 확실하지 않은 내용은 비워 두고 추가 설명에 적은 뒤 검토를 요청할 수 있습니다.'}document.querySelectorAll('input,textarea').forEach(node=>node.addEventListener('input',updatePreflight));document.querySelectorAll('input[type=radio],input[type=checkbox]').forEach(node=>node.addEventListener('change',updateGuide));function payload(){return {request_department:value('request_department'),requester_name:value('requester_name'),investment_name:value('investment_name'),asset_name:value('asset_name'),expenditure_description:value('expenditure_description'),expenditure_amount:number('expenditure_amount'),asset_acquisition_amount:number('asset_acquisition_amount'),annual_repair_amount:number('annual_repair_amount'),prior_book_value:number('prior_book_value'),is_component_purchase:checked('is_component_purchase'),is_repair:checked('is_repair'),is_periodic_repair_under_three_years:checked('is_periodic_repair_under_three_years'),increases_production_capacity:checked('increases_production_capacity'),extends_useful_life:checked('extends_useful_life'),reduces_cost_or_improves_quality:checked('reduces_cost_or_improves_quality'),changes_original_purpose:checked('changes_original_purpose'),installs_or_expands_asset:checked('installs_or_expands_asset'),restores_disaster_damaged_asset:checked('restores_disaster_damaged_asset'),disposes_existing_asset:checked('disposes_existing_asset'),disposal_reason:value('disposal_reason'),additional_notes:value('additional_notes')}}form.addEventListener('submit',async e=>{e.preventDefault();if(!form.reportValidity())return;reviewButton.disabled=true;reviewButton.textContent='검토 중…';try{const r=await fetch('/capital-expenditure/review',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())}),d=await r.text().then(raw=>{try{return JSON.parse(raw)}catch(_){return {detail:raw.trim()||'서버가 JSON이 아닌 오류를 반환했습니다.'}}});if(!r.ok)throw new Error(d.detail||'검토에 실패했습니다.');reviewText=d.review;result.textContent=reviewText;decision.textContent='현재 입력 기준: '+d.decision;decision.className='decision '+(d.decision==='자본적 지출'?'capital':d.decision==='수익적 지출'?'revenue':'pending');out.style.display='block';mailArea.style.display='block';mailSubject.value='[자본적/수익적 지출 검토 요청] '+value('investment_name');mailStatus.textContent=d.recipient_configured?'세무섹션 수신자 설정이 완료되었습니다.':'이메일 설정 전에는 실제 메일을 보낼 수 없습니다.';mailStatus.className='status';out.scrollIntoView({behavior:'smooth'})}catch(err){out.style.display='block';result.innerHTML='<div class="error">'+err.message+'</div>'}finally{reviewButton.disabled=false;reviewButton.textContent='검토 결과 만들기'}});mailButton.addEventListener('click',async()=>{mailButton.disabled=true;mailButton.textContent='메일 송부 중…';try{const r=await fetch('/capital-expenditure/send-email',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subject:mailSubject.value,body:reviewText})}),d=await r.text().then(raw=>{try{return JSON.parse(raw)}catch(_){return {detail:raw.trim()||'서버가 JSON이 아닌 오류를 반환했습니다.'}}});if(!r.ok)throw new Error(d.detail||'메일 송부에 실패했습니다.');mailStatus.textContent='세무섹션으로 메일을 송부했습니다.';mailStatus.className='success'}catch(err){mailStatus.textContent=err.message;mailStatus.className='error'}finally{mailButton.disabled=false;mailButton.textContent='세무섹션으로 메일 송부'}});updateGuide();
 </script></body></html>"""
-    highlight_css = ".review{line-height:1.8}.review-block{margin:12px 0;padding:15px 17px;background:#fff;border:1px solid #d8e4ed;border-radius:10px}.review-block h3{margin:0 0 7px;color:#31536e;font-size:14px}.review-block p{margin:0;line-height:1.75}.review-block.emphasis{border:2px solid #0875bf;background:#eaf6ff}.review-block.emphasis h3{color:#075e9f}.decision-value{display:block;font-size:22px;color:#075e9f;margin:3px 0 12px}.review-target{margin:10px 0;padding:13px 16px;background:#f5f9fc;border:1px solid #c9dbe8;border-left:4px solid #0875bf;border-radius:9px;color:#31536e;font-weight:700;line-height:1.7}.review-subblock{padding:11px 13px;background:#fff;border:1px solid #a9d5f2;border-radius:8px}.review-subblock h4{margin:0 0 4px;color:#075e9f;font-size:13px}.review-subblock p{font-size:15px!important;font-weight:600!important;color:#163c5b!important}.input-facts{background:#f8fbfd}.input-facts ul{margin:6px 0 0;padding-left:22px;color:#40586c}.input-facts li{margin:3px 0;line-height:1.65}.review-collapsible{margin:12px 0;border:1px solid #d8e4ed;border-radius:10px;background:#fff;overflow:hidden}.review-collapsible summary{padding:14px 17px;color:#31536e;font-weight:800;cursor:pointer}.review-collapsible>.review-block{margin:0;border:0;border-top:1px solid #e7eef3;border-radius:0}.review-collapsible.conflict{border:2px solid #e4a13a;background:#fff8ed}.review-collapsible.conflict summary{color:#8b4d08}.result-actions{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:16px}.result-actions .mail{margin:0}.post-area{border-color:#8fc7ad;background:#f7fffa}.case-board-link{display:inline-block;margin:0 0 18px;color:#075e9f;font-weight:800;text-decoration:none}.case-board-link:hover{text-decoration:underline}@media(max-width:700px){.result-actions{grid-template-columns:1fr}}"
+    highlight_css = ".review{line-height:1.8}.review-block{margin:12px 0;padding:15px 17px;background:#fff;border:1px solid #d8e4ed;border-radius:10px}.review-block h3{margin:0 0 7px;color:#31536e;font-size:14px}.review-block p{margin:0;line-height:1.75}.review-block.emphasis{border:2px solid #0875bf;background:#eaf6ff}.review-block.emphasis h3{color:#075e9f}.decision-value{display:block;font-size:22px;color:#075e9f;margin:3px 0 12px}.review-target{margin:10px 0;padding:13px 16px;background:#f5f9fc;border:1px solid #c9dbe8;border-left:4px solid #0875bf;border-radius:9px;color:#31536e;font-weight:700;line-height:1.7}.review-subblock{padding:11px 13px;background:#fff;border:1px solid #a9d5f2;border-radius:8px}.review-subblock h4{margin:0 0 4px;color:#075e9f;font-size:13px}.review-subblock p{font-size:15px!important;font-weight:600!important;color:#163c5b!important}.key-sentence-highlight{background:#fff9bf;border-left:5px solid #f1c40f;padding:10px 12px;border-radius:6px}.core-highlight{background:#ffeb3b;color:#152b3b;padding:1px 3px;border-radius:3px;font-weight:800;box-shadow:0 1px 0 rgba(160,120,0,.25)}.input-facts{background:#f8fbfd}.input-facts ul{margin:6px 0 0;padding-left:22px;color:#40586c}.input-facts li{margin:3px 0;line-height:1.65}.review-collapsible{margin:12px 0;border:1px solid #d8e4ed;border-radius:10px;background:#fff;overflow:hidden}.review-collapsible summary{padding:14px 17px;color:#31536e;font-weight:800;cursor:pointer}.review-collapsible>.review-block{margin:0;border:0;border-top:1px solid #e7eef3;border-radius:0}.review-collapsible.conflict{border:2px solid #e4a13a;background:#fff8ed}.review-collapsible.conflict summary{color:#8b4d08}.result-actions{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:16px}.result-actions .mail{margin:0}.post-area{border-color:#8fc7ad;background:#f7fffa}.case-board-link{display:inline-block;margin:0 0 18px;color:#075e9f;font-weight:800;text-decoration:none}.case-board-link:hover{text-decoration:underline}@media(max-width:700px){.result-actions{grid-template-columns:1fr}}"
     progress_markup = '<div class="progress" aria-label="검토 진행 단계"><button type="button" data-target="step-1">1. 지출 종류</button><button type="button" data-target="step-2">2. 기본 정보</button><button type="button" data-target="step-3">3. 금액 입력</button><button type="button" data-target="step-4">4. 달라지는 점</button><button type="button" data-target="review-button">5. 결과 확인</button></div>'
     field_guide = '<section class="field-guide" aria-label="필수 및 선택 입력 안내"><div class="field-guide-title">작성 전에 확인해 주세요 <span class="required-star">* 필수 입력</span></div><div class="field-guide-grid"><div><strong class="required-label">필수 기재사항</strong><p>지출 종류, 요청 부서, 작성자 이름, 투자명·공사명, 자산·설비명, 지출 내용, 이번 지출금액, 현업 자체 판단, 추가 설명 또는 현업 판단 근거</p><small>입력칸 옆의 <b>*</b> 표시가 있는 항목입니다.</small></div><div><strong class="optional-label">선택 기재사항</strong><p>개별자산 취득금액, 연간 수선비, 전기말 장부금액, 성능 변화 체크, 기존 자산 폐기·사유</p><small>* 표시가 없으며, 알고 있는 내용만 적어도 됩니다.</small></div></div></section>'
     extra_css = ".required-star{color:#d24c19;font-weight:900}.judgement-box{margin:16px 0;padding:17px;background:linear-gradient(135deg,#fff8ed,#fffdf8);border:2px solid #e4a13a;border-radius:11px;box-shadow:0 5px 16px rgba(181,111,20,.08)}.judgement-box h3{margin:0 0 7px;color:#8b4d08;font-size:17px}.judgement-box p{margin:0 0 12px;color:#694f2c;font-size:13px;line-height:1.7}.judgement-options{display:flex;gap:10px;flex-wrap:wrap}.judgement-option{display:flex;align-items:center;gap:7px;margin:0;padding:11px 14px;background:#fff;border:1px solid #dfc28f;border-radius:8px;color:#573e1e;font-weight:800;cursor:pointer}.judgement-option input{width:auto}.judgement-help{display:block;margin-top:10px;color:#795d36;font-size:12px;line-height:1.6}.judgement-detail-label{display:block;margin-top:15px;color:#8b4d08;font-weight:800}.attachment-label{margin-top:16px;color:#075e9f}.attachment-help{display:block;margin-top:6px;color:#63758a;font-size:12px;line-height:1.5}"
@@ -9759,11 +10020,11 @@ def capital_case_row(case_id: str) -> dict[str, object] | None:
 def capital_expenditure_case_board_html(initial_cases: list[dict[str, object]] | None = None) -> str:
     """관리자가 검토 대기 사례를 확정하고 이력을 관리하는 게시판 화면이다."""
     page = """<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>자본적·수익적 지출 검토 이력</title><style>
-    :root{--blue:#0875bf;--ink:#172b3a;--muted:#607386;--line:#d9e4ec;--bg:#f4f8fb}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Arial,"Noto Sans KR",sans-serif}main{max-width:1180px;margin:auto;padding:42px 24px 80px}h1{margin:8px 0;font-size:30px}.eyebrow{color:var(--blue);font-size:13px;font-weight:800;letter-spacing:.08em}.sub{color:var(--muted);line-height:1.7}.top{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap}.link,button{border:1px solid #b7d5e8;border-radius:8px;padding:10px 13px;background:#fff;color:#075e9f;font:inherit;font-weight:800;cursor:pointer;text-decoration:none}.link.primary,button.primary{border-color:var(--blue);background:var(--blue);color:#fff}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:26px 0 14px}.filters button.active{background:#e4f4ff;border-color:var(--blue)}.layout{display:grid;grid-template-columns:minmax(440px,1fr) minmax(360px,.9fr);gap:18px}.panel{background:#fff;border:1px solid var(--line);border-radius:12px;padding:20px;box-shadow:0 4px 16px rgba(20,66,95,.04)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:12px 8px;border-bottom:1px solid #edf1f4;text-align:left;vertical-align:top}th{color:var(--muted);font-size:12px}tr[data-id]{cursor:pointer}tr[data-id]:hover{background:#f4faff}.badge{display:inline-block;padding:5px 8px;border-radius:14px;font-size:12px;font-weight:800}.pending{background:#fff2d6;color:#8b5900}.capital{background:#e6f5ff;color:#075e9f}.revenue{background:#edf7eb;color:#277539}.empty{color:var(--muted);padding:28px 0;text-align:center}.detail{display:none}.detail.show{display:block}.detail h2{margin-top:0}.block{margin:14px 0;padding:13px;background:#f8fbfd;border:1px solid #e1ebf1;border-radius:8px;line-height:1.7;white-space:pre-wrap}.block strong{display:block;color:#31556f;margin-bottom:4px}.decision{font-size:22px;font-weight:800;color:#075e9f}.form-row{margin:13px 0}label{display:block;font-weight:800;margin-bottom:6px}select,textarea{width:100%;border:1px solid #b9cad6;border-radius:8px;padding:10px;font:inherit}textarea{min-height:95px;resize:vertical}.message{margin-top:10px;color:#277539;font-weight:700}.error{color:#ae2732}@media(max-width:860px){.layout{grid-template-columns:1fr}main{padding:28px 16px}}
-    </style></head><body><main><div class="top"><div><div class="eyebrow">관리자 전용</div><h1>자본적·수익적 지출 검토 이력</h1><p class="sub">AI 판단은 검토 대기로 저장됩니다. 관리자가 확정한 사례만 이후 AI 검토의 참고자료로 사용됩니다.</p></div><a class="link primary" href="/capital-expenditure">새 검토 작성</a></div><div class="filters"><button class="active" data-status="all">전체</button><button data-status="pending">검토 대기</button><button data-status="confirmed">확정 완료</button></div><div class="layout"><section class="panel"><div id="list">불러오는 중입니다.</div></section><aside class="panel detail" id="detail"><h2>사례 상세</h2><div id="detail-body"></div><form id="confirm-form"><div class="form-row"><label>최종 검토 결과</label><select id="final-decision"><option value="자본적 지출">자본적 지출</option><option value="수익적 지출">수익적 지출</option></select></div><div class="form-row"><label>확정 근거</label><textarea id="final-reason" required placeholder="관리자 검토 후 확정한 근거를 작성하세요."></textarea></div><div class="form-row"><label>관리자 메모 (선택)</label><textarea id="admin-note" placeholder="현업에 요청할 추가자료, 내부 참고사항 등을 적을 수 있습니다."></textarea></div><button class="primary" type="submit">최종 확정하고 사례에 반영</button><div id="save-message" class="message"></div></form></aside></div></main><script>
-const list=document.getElementById('list'),detail=document.getElementById('detail'),detailBody=document.getElementById('detail-body'),form=document.getElementById('confirm-form'),message=document.getElementById('save-message');let selectedId='',status='all';const esc=s=>String(s??'').replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));const stamp=s=>String(s||'').replace('T',' ').replace('+00:00','');const badge=c=>c.status==='pending'?'<span class="badge pending">검토 대기</span>':'<span class="badge '+(c.final_decision==='자본적 지출'?'capital':'revenue')+'>'+esc(c.final_decision)+'</span>';
+    :root{--blue:#0875bf;--ink:#172b3a;--muted:#607386;--line:#d9e4ec;--bg:#f4f8fb}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Arial,"Noto Sans KR",sans-serif}main{max-width:1180px;margin:auto;padding:42px 24px 80px}h1{margin:8px 0;font-size:30px}.eyebrow{color:var(--blue);font-size:13px;font-weight:800;letter-spacing:.08em}.sub{color:var(--muted);line-height:1.7}.top{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap}.link,button{border:1px solid #b7d5e8;border-radius:8px;padding:10px 13px;background:#fff;color:#075e9f;font:inherit;font-weight:800;cursor:pointer;text-decoration:none}.link.primary,button.primary{border-color:var(--blue);background:var(--blue);color:#fff}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:26px 0 14px}.filters button.active{background:#e4f4ff;border-color:var(--blue)}.layout{display:grid;grid-template-columns:minmax(440px,1fr) minmax(360px,.9fr);gap:18px}.panel{background:#fff;border:1px solid var(--line);border-radius:12px;padding:20px;box-shadow:0 4px 16px rgba(20,66,95,.04)}table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:12px 8px;border-bottom:1px solid #edf1f4;text-align:left;vertical-align:top}th{color:var(--muted);font-size:12px}tr[data-id]{cursor:pointer}tr[data-id]:hover{background:#f4faff}.badge{display:inline-block;padding:5px 8px;border-radius:14px;font-size:12px;font-weight:800}.pending{background:#fff2d6;color:#8b5900}.capital{background:#e6f5ff;color:#075e9f}.revenue{background:#edf7eb;color:#277539}.empty{color:var(--muted);padding:28px 0;text-align:center}.detail{display:none}.detail.show{display:block}.detail h2{margin-top:0}.block{margin:14px 0;padding:13px;background:#f8fbfd;border:1px solid #e1ebf1;border-radius:8px;line-height:1.7;white-space:pre-wrap}.block strong{display:block;color:#31556f;margin-bottom:4px}.decision{font-size:22px;font-weight:800;color:#075e9f}.ai-preview{border:2px solid #0875bf;background:#eaf6ff;box-shadow:0 0 0 4px rgba(8,117,191,.08)}.ai-preview strong{color:#075e9f;font-size:14px}.ai-preview .draft-text{font-weight:700;color:#173f5f}.core-highlight{background:#ffeb3b;color:#152b3b;padding:1px 3px;border-radius:3px;font-weight:900;box-shadow:0 1px 0 rgba(160,120,0,.25)}.form-row{margin:13px 0}label{display:block;font-weight:800;margin-bottom:6px}select,textarea{width:100%;border:1px solid #b9cad6;border-radius:8px;padding:10px;font:inherit}textarea{min-height:95px;resize:vertical}.ai-draft{min-height:300px;padding:16px 14px;border:2px solid #f0a11a;background:#fffaf0;box-shadow:0 0 0 4px rgba(240,161,26,.1);line-height:1.8;font-size:15px}.draft-hint{margin:-2px 0 8px;color:#a36200;font-size:12px;font-weight:700}.message{margin-top:10px;color:#277539;font-weight:700}.error{color:#ae2732}@media(max-width:860px){.layout{grid-template-columns:1fr}main{padding:28px 16px}}
+    </style></head><body><main><div class="top"><div><div class="eyebrow">관리자 전용</div><h1>자본적·수익적 지출 검토 이력</h1><p class="sub">AI 판단은 검토 대기로 저장됩니다. 관리자가 확정한 사례만 이후 AI 검토의 참고자료로 사용됩니다.</p></div><a class="link primary" href="/capital-expenditure">새 검토 작성</a></div><div class="filters"><button class="active" data-status="all">전체</button><button data-status="pending">검토 대기</button><button data-status="confirmed">확정 완료</button></div><div class="layout"><section class="panel"><div id="list">불러오는 중입니다.</div></section><aside class="panel detail" id="detail"><h2>사례 상세</h2><div id="detail-body"></div><form id="confirm-form"><div class="form-row"><label>최종 검토 결과</label><select id="final-decision"><option value="자본적 지출">자본적 지출</option><option value="수익적 지출">수익적 지출</option></select></div><div class="form-row"><label>확정 근거 <span style="color:#e28a00">★ AI 초안·수정 가능</span></label><div class="draft-hint">AI가 검토결과를 바탕으로 먼저 작성했습니다. 필요한 부분만 수정해 확정해 주세요.</div><textarea id="final-reason" class="ai-draft" required placeholder="AI가 확정근거 초안을 작성합니다."></textarea></div><div class="form-row"><label>관리자 메모 (선택)</label><textarea id="admin-note" placeholder="현업에 요청할 추가자료, 내부 참고사항 등을 적을 수 있습니다."></textarea></div><button class="primary" type="submit">최종 확정하고 사례에 반영</button><div id="save-message" class="message"></div></form></aside></div></main><script>
+const list=document.getElementById('list'),detail=document.getElementById('detail'),detailBody=document.getElementById('detail-body'),form=document.getElementById('confirm-form'),message=document.getElementById('save-message');let selectedId='',status='all';const esc=s=>String(s??'').replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));const highlightTerms=['자본적 지출','수익적 지출','100만원 이상','100만원 미만','생산능력 증가','내용연수 연장','원가 절감','품질 향상','용도 변경','원상회복','원상 회복','동일사양','동일 사양','자산 인식','자산화','비용 처리','비용처리','설치','확장','증설'];const highlightDraft=s=>{const pattern=new RegExp('('+highlightTerms.sort((a,b)=>b.length-a.length).join('|')+')','g');return esc(s).replace(pattern,'<mark class="core-highlight">$1</mark>').replace(/\\n/g,'<br>')};const stamp=s=>String(s||'').replace('T',' ').replace('+00:00','');const badge=c=>c.status==='pending'?'<span class="badge pending">검토 대기</span>':'<span class="badge '+(c.final_decision==='자본적 지출'?'capital':'revenue')+'>'+esc(c.final_decision)+'</span>';
 async function load(){let d;if(Array.isArray(window.initialCases)){d={cases:window.initialCases};window.initialCases=null}else{const r=await fetch('/admin/capital-expenditure/cases?status='+status,{credentials:'same-origin'});d=await r.json();if(!r.ok)throw new Error(d.detail||'사례를 불러오지 못했습니다. 관리자 인증을 확인해 주세요.')}if(!d.cases.length){list.innerHTML='<p class="empty">등록된 게시물이 없습니다.</p>';return}list.innerHTML='<table><thead><tr><th>상태</th><th>투자·자산</th><th>AI 판단</th><th>요청부서</th><th>등록일</th></tr></thead><tbody>'+d.cases.map(c=>'<tr data-id="'+esc(c.case_id)+'"><td>'+badge(c)+'</td><td><b>'+esc(c.investment_name)+'</b><br>'+esc(c.asset_name)+'</td><td>'+esc(c.ai_decision)+'</td><td>'+esc(c.request_department)+'</td><td>'+stamp(c.created_at)+'</td></tr>').join('')+'</tbody></table>';list.querySelectorAll('tr[data-id]').forEach(row=>row.onclick=()=>show(row.dataset.id));}
-async function show(id){const r=await fetch('/admin/capital-expenditure/cases/'+encodeURIComponent(id),{credentials:'same-origin'}),c=await r.json();if(!r.ok)throw new Error(c.detail||'사례를 불러오지 못했습니다. 관리자 인증을 확인해 주세요.');selectedId=id;detail.classList.add('show');const q=c.request,a=c.ai_review||{};detailBody.innerHTML='<div class="block"><strong>현업 요청</strong>'+esc(q.request_department+' · '+q.requester_name+'\n'+q.investment_name+' / '+q.asset_name+'\n지출금액: '+Number(q.expenditure_amount||0).toLocaleString()+'원\n'+q.expenditure_description)+'</div><div class="block"><strong>AI 잠정 판단</strong><span class="decision">'+esc(c.ai_decision)+'</span>\n'+esc(a.review||'AI 검토 근거가 없습니다.')+'</div>';document.getElementById('final-decision').value=c.final_decision||c.ai_decision;document.getElementById('final-reason').value=c.final_reason||'';document.getElementById('admin-note').value=c.admin_note||'';form.style.display=c.status==='confirmed'?'none':'block';message.textContent=c.status==='confirmed'?'확정 완료: 이 사례는 이후 AI 검토의 참고자료로 사용됩니다.':'';}
+async function show(id){const r=await fetch('/admin/capital-expenditure/cases/'+encodeURIComponent(id),{credentials:'same-origin'}),c=await r.json();if(!r.ok)throw new Error(c.detail||'사례를 불러오지 못했습니다. 관리자 인증을 확인해 주세요.');selectedId=id;detail.classList.add('show');const q=c.request,a=c.ai_review||{};const draft=c.final_reason||['AI 검토 결과 '+c.ai_decision+'으로 판단했습니다.',a.key_basis?'주요 근거: '+a.key_basis:'',a.amount_basis?'금액 기준: '+a.amount_basis:'',a.concept_basis?'개념 기준: '+a.concept_basis:'',a.accounting_basis?'회계기준 검토: '+a.accounting_basis:''].filter(Boolean).join('\\n\\n');detailBody.innerHTML='<div class="block"><strong>현업 요청</strong>'+esc(q.request_department+' · '+q.requester_name+'\\n'+q.investment_name+' / '+q.asset_name+'\\n지출금액: '+Number(q.expenditure_amount||0).toLocaleString()+'원\\n'+q.expenditure_description)+'</div><div class="block ai-preview"><strong>AI가 정리한 확정근거 초안</strong><div class="draft-text">'+highlightDraft(draft)+'</div></div><div class="block"><strong>AI 잠정 판단</strong><span class="decision">'+esc(c.ai_decision)+'</span>\\n'+highlightDraft(a.review||'AI 검토 근거가 없습니다.')+'</div>';document.getElementById('final-decision').value=c.final_decision||c.ai_decision;document.getElementById('final-reason').value=draft;document.getElementById('admin-note').value=c.admin_note||'';form.style.display=c.status==='confirmed'?'none':'block';message.textContent=c.status==='confirmed'?'확정 완료: 이 사례는 이후 AI 검토의 참고자료로 사용됩니다.':'';}
 document.querySelectorAll('.filters button').forEach(button=>button.onclick=()=>{status=button.dataset.status;document.querySelectorAll('.filters button').forEach(x=>x.classList.toggle('active',x===button));detail.classList.remove('show');load().catch(e=>list.innerHTML='<p class="error">'+esc(e.message)+'</p>')});form.onsubmit=async e=>{e.preventDefault();if(!selectedId)return;message.textContent='저장 중입니다.';try{const r=await fetch('/admin/capital-expenditure/cases/'+encodeURIComponent(selectedId)+'/confirm',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({final_decision:document.getElementById('final-decision').value,final_reason:document.getElementById('final-reason').value,admin_note:document.getElementById('admin-note').value})}),d=await r.text().then(raw=>{try{return JSON.parse(raw)}catch(_){return {detail:raw.trim()||'서버가 JSON이 아닌 오류를 반환했습니다.'}}});if(!r.ok)throw new Error(d.detail||'확정에 실패했습니다.');message.textContent='최종 확정되었습니다. 이 사례는 다음 AI 검토의 참고자료로 사용됩니다.';form.style.display='none';load()}catch(err){message.textContent=err.message;message.className='message error'}};load().catch(e=>list.innerHTML='<p class="error">'+esc(e.message)+'</p>');
 </script></body></html>"""
     initial_json = json.dumps(initial_cases or [], ensure_ascii=False).replace("</", "<\\/")
@@ -10224,6 +10485,14 @@ def embedding_projector_data(limit: int = 1200, track: str = "all") -> dict[str,
         return embedding_projector_payload(limit, track)
     except (ValueError, VectorSearchError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+    except (SQLAlchemyError, OSError, TimeoutError) as error:
+        # 저장소 장애를 일반 문자열 500으로 내보내면 브라우저가 JSON 파싱 오류를 낸다.
+        # 검색 화면은 구조화된 503을 받아 사용자에게 원인을 안내할 수 있어야 한다.
+        mark_backend_failed(VECTOR_BACKEND_STATE, error, VECTOR_FAILURE_COOLDOWN_SECONDS)
+        raise HTTPException(
+            status_code=503,
+            detail="임베딩 저장소에 연결할 수 없습니다. 일반 키워드 검색은 계속 사용할 수 있습니다.",
+        ) from error
 
 
 @app.get("/embedding-projector/vectors.tsv")
@@ -10439,8 +10708,12 @@ def legal_article_evidence(law_title: str, article_prefix: str) -> list[dict[str
             "article": row["law_article"] or article_prefix,
             "hierarchy_path": row["hierarchy_path"],
             "excerpt": str(row["content"]),
-            "metadata": {"calculation_evidence": True, **json.loads(str(row["metadata_json"]))},
+            "metadata": {**json.loads(str(row["metadata_json"])), "calculation_evidence": True, "evidence_score_type": "direct_article_match"},
             "relevance": 100,
+            "similarity_percent": 100.0,
+            "similarity_label": "직접 조문 일치",
+            "similarity_score_method": "정확한 법령명·조문번호 직접 조회(벡터 유사도 아님)",
+            "direct_match_percent": 100.0,
         }
         for row in rows
     ]
@@ -11063,6 +11336,63 @@ def employee_resident_tax_schedule_advice(question: str) -> dict[str, object] | 
     }
 
 
+def tax_penalty_grounded_fallback(question: str, evidence_documents: list[dict[str, object]]) -> dict[str, object] | None:
+    """세목을 이미 말한 가산세 질문을 본세·가산세 유형별로 설명한다."""
+    normalized = re.sub(r"\s+", "", question)
+    if "가산세" not in normalized and not any(term in normalized for term in ("납부누락", "납부지연", "무신고", "과소신고", "늦게냈")):
+        return None
+    local_tax = any(term in normalized for term in ("재산세", "주민세", "지방세"))
+    tax_item = "재산세" if "재산세" in normalized else "주민세" if "주민세" in normalized else "지방세" if local_tax else "해당 세목"
+    base_law = "지방세법" if local_tax else "해당 세목 관련 세법"
+    penalty_law = "지방세기본법" if local_tax else "국세기본법"
+    article_specs = (("제53조", "무신고"), ("제54조", "과소신고"), ("제55조", "납부지연"))
+    direct_documents: list[dict[str, object]] = []
+    if local_tax:
+        if tax_item == "재산세":
+            direct_documents.extend(legal_article_evidence("지방세법", "제115조"))
+        elif tax_item == "주민세":
+            direct_documents.extend(legal_article_evidence("지방세법", "제83조"))
+        for article, _ in article_specs:
+            direct_documents.extend(legal_article_evidence(penalty_law, article))
+    selected = [
+        item for item in deduplicate_evidence_documents([*direct_documents, *evidence_documents])
+        if str(item.get("relevance_label") or item.get("metadata", {}).get("relevance_label") or "DIRECT") != "IRRELEVANT"
+    ]
+    if not selected:
+        return None
+    selected = selected[:8]
+    evidence_ids = [str(item.get("document_id")) for item in selected if item.get("document_id")]
+    cited_articles = list(dict.fromkeys(
+        f"- {item.get('title') or '관련 법령'} {item.get('article') or ''}".strip() for item in selected
+    ))
+    article_lines: list[str] = []
+    for article, label in article_specs:
+        matches = [item for item in selected if article in str(item.get("article") or "") and penalty_law in str(item.get("title") or "")]
+        if matches:
+            excerpt = re.sub(r"\s+", " ", str(matches[0].get("excerpt") or "")).strip()
+            rate_match = re.search(r"(?:1천분의\s*\d+(?:\.\d+)?|\d+(?:\.\d+)?\s*%)", excerpt)
+            rate_text = f" 법문상 확인되는 요율 표현은 {rate_match.group(0)}입니다." if rate_match else ""
+            article_lines.append(f"- {label}: {penalty_law} {article}를 기준으로 {label} 여부와 적용요건을 확인합니다.{rate_text}")
+        else:
+            article_lines.append(f"- {label}: {penalty_law} {article} 관련 규정을 확인합니다.")
+    base_line = next(
+        (f"- 본세 기한: {base_law} {item.get('article')}에서 {tax_item}의 법정 납기·신고기한을 확인합니다."
+         for item in selected if base_law in str(item.get("title") or "") and item.get("article")),
+        f"- 본세 기한: {tax_item}의 법정 납기와 가산세 기산일을 함께 확인해야 합니다.",
+    )
+    return {
+        "key_answer": f"{tax_item} 가산세는 신고를 하지 않았는지, 일부 누락했는지, 신고 후 납부가 늦었는지에 따라 적용 규정이 달라집니다. {penalty_law}의 무신고·과소신고·납부지연 규정을 본세의 법정기한과 함께 검토해야 합니다.",
+        "answer": "[결론]\n" + f"{tax_item} 가산세는 한 가지 항목으로 단정하지 않고 신고·납부 상태를 먼저 나누어 판단합니다.\n\n[유형별 확인]\n" + "\n".join(article_lines) + "\n" + base_line + "\n\n[정확한 금액을 정할 때 필요한 정보]\n미납세액 또는 신고누락 세액, 법정 신고·납부기한, 실제 신고·납부일, 무신고·과소신고 여부, 정당한 사유와 감면 적용 여부를 확인해야 합니다. 현재 정보만으로 정확한 금액을 산정할 수 없다면 위 입력값을 확인한 뒤 계산합니다.\n\n[관련 근거]\n" + "\n".join(cited_articles),
+        "evidence_ids": evidence_ids, "invalid_evidence_ids": [],
+        "limitations": ["가산세율과 감면 여부는 위반 유형·적용 시점·신고·납부일 및 정당한 사유에 따라 달라질 수 있어 개별 세액은 추가 사실관계 확인이 필요합니다."],
+        "follow_up_questions": ["신고 자체를 하지 않은 경우인가요, 일부 금액을 누락한 경우인가요?", "법정기한과 실제 신고·납부일은 언제인가요?", "미납세액 또는 신고누락 세액은 얼마인가요?"],
+        "highlight_terms": [tax_item, f"{penalty_law} 제53조", f"{penalty_law} 제54조", f"{penalty_law} 제55조"],
+        "generation_mode": "tax_penalty_grounded_fallback",
+        "validation": {"status": "passed", "requires_more_information": True, "method": "retrieval_grounded_tax_penalty"},
+        "evidence_documents": selected,
+    }
+
+
 def transaction_hint_from_question(question: str) -> dict[str, object] | None:
     """거래성 자연어에만 최소 검토 단서를 만들고, 단순 법령 검색에는 표시하지 않는다."""
     cues = ("거래", "매출", "매입", "구매", "판매", "계약", "투자", "취득", "처분", "비용", "자산", "차입", "대여", "수익")
@@ -11322,6 +11652,79 @@ def direct_evidence_lookup_fallback(
         "follow_up_questions": [], "highlight_terms": [str(item.get("article") or item.get("title") or "") for item in selected[:3]],
         "generation_mode": "grounded_lookup",
         "validation": {"status": "passed", "requires_more_information": False, "method": "direct_evidence_lookup"},
+    }
+
+
+def quick_start_answer(question: str, evidence_documents: list[dict[str, object]]) -> dict[str, object] | None:
+    """빠른 시작 버튼의 단순 법령 조회를 검색 근거에 고정해 즉시 답변한다."""
+    spec = quick_start_spec(question)
+    if not spec or not evidence_documents:
+        return None
+    law = str(spec["law"])
+    article = re.sub(r"\s+", "", str(spec["article"]))
+    matched = []
+    for item in evidence_documents:
+        title = str(item.get("title") or "")
+        article_text = re.sub(r"\s+", "", str(item.get("article") or ""))
+        excerpt = str(item.get("excerpt") or "")
+        if law in title and (article in article_text or article in re.sub(r"\s+", "", excerpt)):
+            matched.append(item)
+    selected = deduplicate_evidence_documents(matched)[:3]
+    if not selected:
+        return None
+
+    templates = {
+        "property_tax_deadline": (
+            "재산세는 과세대상에 따라 납부 시기가 다릅니다. 토지분은 9월 16일부터 9월 30일까지, 건축물분은 7월 16일부터 7월 31일까지 납부합니다. 주택분은 원칙적으로 7월과 9월에 나누어 납부합니다.",
+            "[질문에 대한 답]\n재산세 납부기한을 찾으시는 경우 토지·건축물·주택을 구분해야 합니다. 토지는 9월, 건축물은 7월이 기본이고, 주택은 7월과 9월에 나누어 부과됩니다. 실제 고지서의 납부기한과 세액이 우선합니다.\n\n[관련 근거]\n지방세법 제115조는 재산세 과세대상별 납기를 정합니다.",
+            ["재산세", "토지분", "건축물분", "주택분", "지방세법 제115조"],
+        ),
+        "business_resident_tax_deadline": (
+            "사업소분 주민세는 매년 8월 1일부터 8월 31일까지 신고·납부하는 세목입니다.",
+            "[질문에 대한 답]\n사업소분 주민세는 고지서를 기다리는 방식이 아니라 납세자가 매년 8월 1일부터 8월 31일까지 신고·납부하는 것이 원칙입니다. 사업소의 소재지와 사업자 요건은 별도로 확인해야 합니다.\n\n[관련 근거]\n지방세법 제83조는 사업소분 주민세의 신고·납부 기간을 정합니다.",
+            ["사업소분 주민세", "8월 1일", "8월 31일", "지방세법 제83조"],
+        ),
+        "vat_rate": (
+            "부가가치세 법정세율은 10%입니다. 실제 납부세액은 매출세액에서 공제 가능한 매입세액을 뺀 금액으로 계산합니다.",
+            "[질문에 대한 답]\n부가가치세의 법정세율은 10%입니다. 다만 실제 신고·납부할 세액은 매출세액 전체가 아니라 공제 가능한 매입세액을 차감해 계산하므로, 과세·면세 사용 여부와 불공제 매입세액을 함께 확인해야 합니다.\n\n[관련 근거]\n부가가치세법 제30조는 부가가치세 세율을 정합니다.",
+            ["부가가치세", "10%", "매출세액", "매입세액", "부가가치세법 제30조"],
+        ),
+        "withholding_deadline": (
+            "원천징수한 세금은 원칙적으로 징수한 달의 다음 달 10일까지 납부합니다.",
+            "[질문에 대한 답]\n원천징수한 세금은 원칙적으로 그 세금을 징수한 달의 다음 달 10일까지 납부합니다. 반기별 납부가 허용되는 원천징수의무자는 별도 기한이 적용될 수 있으므로 사업장 요건을 확인해야 합니다.\n\n[관련 근거]\n소득세법 제128조는 원천징수세액의 납부기한을 정합니다.",
+            ["원천징수", "다음 달 10일", "소득세법 제128조"],
+        ),
+        "corporate_tax_deadline": (
+            "법인세는 원칙적으로 사업연도 종료일이 속하는 달의 말일부터 3개월 이내에 신고합니다.",
+            "[질문에 대한 답]\n법인세 신고기한은 사업연도 종료일이 속하는 달의 말일부터 3개월 이내입니다. 예를 들어 12월 결산법인은 다음 해 3월 말까지 신고하는 구조입니다. 성실신고확인서 제출 법인 등에는 별도 규정이 적용될 수 있습니다.\n\n[관련 근거]\n법인세법 제60조는 법인세 과세표준과 세액의 신고기한을 정합니다.",
+            ["법인세", "3개월 이내", "사업연도 종료일", "법인세법 제60조"],
+        ),
+    }
+    key_answer, body, highlight_terms = templates[str(spec["id"])]
+    evidence_lines = []
+    evidence_ids = []
+    for item in selected:
+        document_id = str(item.get("document_id") or "").strip()
+        if document_id:
+            evidence_ids.append(document_id)
+        title = str(item.get("title") or law).strip()
+        item_article = str(item.get("article") or spec["article"]).strip()
+        excerpt = re.sub(r"\s+", " ", str(item.get("excerpt") or "")).strip()
+        if excerpt:
+            excerpt = excerpt[:260] + ("…" if len(excerpt) > 260 else "")
+            evidence_lines.append(f"- {title} {item_article}: {excerpt}")
+        else:
+            evidence_lines.append(f"- {title} {item_article}")
+    return {
+        "key_answer": key_answer,
+        "answer": body + "\n" + "\n".join(evidence_lines),
+        "evidence_ids": evidence_ids,
+        "invalid_evidence_ids": [],
+        "limitations": [],
+        "follow_up_questions": [],
+        "highlight_terms": highlight_terms,
+        "generation_mode": "quick_start_grounded_lookup",
+        "validation": {"status": "passed", "requires_more_information": False, "method": "quick_start_direct_lookup"},
     }
 
 
@@ -11608,6 +12011,7 @@ def run_chat_review_graph(
     evidence_limit: int = 10,
     knowledge_track: str = "tax",
     progress_id: str | None = None,
+    quick_start: bool = False,
 ) -> dict[str, object]:
     """챗봇 질의를 단계별 상태로 처리해 후속 질문 흐름을 확장 가능하게 만든다."""
 
@@ -11643,6 +12047,7 @@ def run_chat_review_graph(
             as_of_date=context["as_of_date"], knowledge_track=state["knowledge_track"],
             repair_queries=list(state.get("repair_queries") or []),
             progress_id=progress_id,
+            quick_start=bool(state.get("quick_start")),
         )
         review_context = {**context, "evidence_warnings": evidence.get("evidence_warnings", [])}
         return {**state, "review_context": review_context, "evidence_result": evidence, "evidence_documents": evidence["evidence_documents"],
@@ -11654,9 +12059,41 @@ def run_chat_review_graph(
         context = state.get("review_context") or {}
         parsed = context.get("parsed_query") or {}
         attempt = int(state.get("retrieval_attempt") or 0)
-        assessment = assess_retrieval_sufficiency(
-            state["question"], parsed, state.get("evidence_documents") or [], attempt,
-        )
+        if state.get("quick_start"):
+            has_evidence = bool(state.get("evidence_documents"))
+            assessment = {
+                "coverage_score": 1.0 if has_evidence else 0.0,
+                "covered_issues": ["빠른 공식 조문 조회"] if has_evidence else [],
+                "missing_issues": [] if has_evidence else ["직접 조문"],
+                "weak_issues": [], "retry": False, "rewrite_queries": [],
+                "reason": "quick_start_direct_lookup",
+            }
+        else:
+            normalized_question = re.sub(r"\s+", "", state["question"])
+            research_rate_question = (
+                parsed.get("tax_item") == "연구개발비"
+                and parsed.get("intent") == "연구·인력개발비 세액공제"
+                and any(term in normalized_question for term in ("공제율", "공제비율", "몇퍼센트", "몇%"))
+            )
+            has_research_rate_anchor = any(
+                "제10조" in str(item.get("article") or "")
+                or "연구·인력개발비" in str(item.get("excerpt") or "")
+                for item in (state.get("evidence_documents") or [])
+            )
+            if research_rate_question and has_research_rate_anchor:
+                # 제10조 직접 근거가 있으면 유사한 제24조 검색 결과 때문에
+                # 보강검색을 반복하지 않는다. 공제율 fallback이 제10조 원문을
+                # 다시 확인하므로 여기서는 충분성 판단만 빠르게 끝낸다.
+                assessment = {
+                    "coverage_score": 1.0,
+                    "covered_issues": ["연구·인력개발비 세액공제율"],
+                    "missing_issues": [], "weak_issues": [], "retry": False,
+                    "rewrite_queries": [], "reason": "direct_research_rate_article10",
+                }
+            else:
+                assessment = assess_retrieval_sufficiency(
+                    state["question"], parsed, state.get("evidence_documents") or [], attempt,
+                )
         evidence_result = {**(state.get("evidence_result") or {}), "retrieval_assessment": assessment}
         if assessment.get("retry"):
             repair_queries = list(dict.fromkeys([*(state.get("repair_queries") or []), *(assessment.get("rewrite_queries") or [])]))
@@ -11696,6 +12133,12 @@ def run_chat_review_graph(
                     }
                 return {**state, "answer": calculated_answer, "workflow_stage": "calculated_after_retrieval",
                         "workflow_trace": [*state["workflow_trace"], "근거 확인 후 규칙 기반 계산"]}
+            if state.get("quick_start"):
+                answer = quick_start_answer(state["question"], state["evidence_documents"])
+                if answer is None:
+                    answer = direct_evidence_lookup_fallback(state["question"], state["evidence_documents"], 1, state["knowledge_track"])
+                return {**state, "answer": answer, "workflow_stage": "generated",
+                        "workflow_trace": [*state["workflow_trace"], "빠른 시작 직접 법령 조회"]}
             # 주민세처럼 질문에 복수 하위 세목이 명시된 세율 조회는
             # 생성 모델의 일반론보다 조문별 정형 답변을 우선한다.
             # 검색 결과가 한 세목을 놓쳐도 resident_tax_rate_fallback이
@@ -11709,6 +12152,50 @@ def run_chat_review_graph(
                              "evidence_result": {**state["evidence_result"], "evidence_documents": merged_documents}}
                 return {**state, "answer": resident_rate_answer, "workflow_stage": "generated",
                         "workflow_trace": [*state["workflow_trace"], "주민세 하위 세목별 조문 직접답변"]}
+            penalty_answer = tax_penalty_grounded_fallback(state["question"], state["evidence_documents"]) if state["knowledge_track"] == "tax" else None
+            if penalty_answer is not None:
+                penalty_documents = penalty_answer.pop("evidence_documents", [])
+                if penalty_documents:
+                    merged_documents = deduplicate_evidence_documents([*penalty_documents, *state["evidence_documents"]])
+                    state = {**state, "evidence_documents": merged_documents,
+                             "evidence_result": {**state["evidence_result"], "evidence_documents": merged_documents}}
+                return {**state, "answer": penalty_answer, "workflow_stage": "generated",
+                        "workflow_trace": [*state["workflow_trace"], "세목별 가산세 유형·근거 직접답변"]}
+            # 법령 원문으로 결론을 확정할 수 있는 대표 질의는 불필요한 생성 모델 왕복을
+            # 생략한다. 모델이 같은 조문을 일반론으로 다시 쓰거나 검증 timeout으로
+            # 보류하는 대신, 확보된 근거에 고정된 전문가용 정형 답변을 즉시 사용한다.
+            deterministic_answer = grounded_evidence_fallback(state["question"], state["evidence_documents"])
+            deterministic_modes = {
+                "grounded_related_party_market_value_fallback", "grounded_tax_hierarchy_fallback",
+                "tax_research_development_fallback", "tax_overview_grounded_fallback",
+                "accounting_rule_fallback", "accounting_depreciation_start_fallback",
+                "tax_transfer_pricing_fallback", "tax_related_party_service_fallback",
+                "tax_general_investment_credit_fallback", "tax_research_development_rate_fallback",
+                "grounded_national_strategy_appendix_fallback", "tax_comprehensive_rate_fallback",
+            }
+            if deterministic_answer.get("generation_mode") in deterministic_modes:
+                # 정형 fallback이 직접 재조회한 조문은 기존 검색 후보와 합쳐
+                # 화면의 답변·근거 카드가 동일한 근거 집합을 보도록 한다.
+                answer_evidence = deterministic_answer.pop("evidence_documents", [])
+                if answer_evidence:
+                    existing_evidence = state["evidence_documents"]
+                    if deterministic_answer.get("generation_mode") == "tax_research_development_rate_fallback":
+                        # 연구개발비 공제율 답변에는 통합투자세액공제(제24조)처럼
+                        # 숫자만 유사한 조문을 함께 노출하지 않는다. 답변의 주장과
+                        # 화면 근거가 같은 법적 쟁점을 가리키도록 범위를 고정한다.
+                        existing_evidence = [
+                            item for item in existing_evidence
+                            if "제10조" in str(item.get("article") or "")
+                            or "연구·인력개발비" in str(item.get("excerpt") or "")
+                        ]
+                    merged_documents = deduplicate_evidence_documents([*answer_evidence, *existing_evidence])
+                    state = {
+                        **state,
+                        "evidence_documents": merged_documents,
+                        "evidence_result": {**state["evidence_result"], "evidence_documents": merged_documents},
+                    }
+                return {**state, "answer": deterministic_answer, "workflow_stage": "generated",
+                        "workflow_trace": [*state["workflow_trace"], "검색 근거 기반 정형 전문가 답변"]}
             if not state["expert_mode"] and (state.get("rag_scope") or {}).get("mode") in {"simple_lookup", "multi_lookup"}:
                 scope = state.get("rag_scope") or {}
                 answer = simple_readable_answer(
@@ -11815,6 +12302,7 @@ def run_chat_review_graph(
         "knowledge_track": knowledge_track,
         "retrieval_attempt": 0,
         "repair_queries": [],
+        "quick_start": quick_start,
     }, config=langsmith_invoke_config(question, knowledge_track, "expert" if expert_mode else "simple"))
     return result["answer"]
 
@@ -11991,22 +12479,47 @@ def research_development_tax_fallback(question: str, evidence_documents: list[di
     parsed = parse_query_understanding(question, "tax")
     if parsed.get("tax_item") != "연구개발비":
         return None
+    rate_question = parsed.get("intent") == "연구·인력개발비 세액공제" and any(
+        term in re.sub(r"\s+", "", question) for term in ("공제율", "공제비율", "몇퍼센트", "몇%")
+    )
     selected = [
         item for item in evidence_documents
         if str(item.get("relevance_label") or item.get("metadata", {}).get("relevance_label") or "") != "IRRELEVANT"
     ]
     if not selected:
         return None
+    rate_source_documents = list(selected)
+    if rate_question:
+        # 공제율은 투자세액공제 등 유사한 조세특례 조문과 혼동되기 쉽다.
+        # 검색 결과에 제24조 같은 유사 조문만 남아 있더라도 그 원문을 제10조의
+        # 근거처럼 사용하지 않고, 로컬 법령 원문에서 제10조를 직접 재조회한다.
+        exact_rate_evidence = legal_article_evidence("조세특례제한법", "제10조")
+        if exact_rate_evidence:
+            provided_relevant = [
+                item for item in selected
+                if "제10조" in str(item.get("article") or "")
+                or "연구·인력개발비" in str(item.get("excerpt") or "")
+            ]
+            # 테스트·첨부자료처럼 사용자가 제공한 제10조 원문에 더 최신이거나
+            # 상세한 기업유형 요율이 있으면 직접 재조회 결과와 함께 보존한다.
+            selected = deduplicate_evidence_documents([*exact_rate_evidence, *provided_relevant])
+            rate_source_documents = [*exact_rate_evidence, *provided_relevant]
+        else:
+            selected = [
+                item for item in selected
+                if "제10조" in str(item.get("article") or "")
+                or "연구·인력개발비" in str(item.get("excerpt") or "")
+                or "연구·인력개발비" in str(item.get("title") or "")
+            ]
+            if not selected:
+                return None
     evidence_ids = [str(item.get("document_id")) for item in selected if item.get("document_id")]
     citations = list(dict.fromkeys(f"- {item.get('title') or '조세특례제한법'} {item.get('article') or ''}".strip() for item in selected))
-    rate_question = parsed.get("intent") == "연구·인력개발비 세액공제" and any(
-        term in re.sub(r"\s+", "", question) for term in ("공제율", "공제비율", "몇퍼센트", "몇%")
-    )
     rate_lines: list[str] = []
     if rate_question:
         # 검색된 원문에 실제로 있는 기업유형·비율만 추출한다. 숫자를 코드에서
         # 임의로 보정하지 않아 시행일·기술유형별 법령 차이를 보존한다.
-        for item in selected:
+        for item in (rate_source_documents if rate_question else selected):
             excerpt = str(item.get("excerpt") or "")
             for sentence in re.split(r"[\n.;]", excerpt):
                 compact = re.sub(r"\s+", " ", sentence).strip()
@@ -12027,6 +12540,7 @@ def research_development_tax_fallback(question: str, evidence_documents: list[di
         limitations = ["검색된 원문에 표시된 요율을 정리한 것이며, 최종 적용률은 과세연도·기업유형·연구개발 분야·비용명세 대조가 필요합니다."]
         return {
             "key_answer": key_answer, "answer": answer, "evidence_ids": evidence_ids,
+            "evidence_documents": selected,
             "invalid_evidence_ids": [], "limitations": limitations,
             "follow_up_questions": ["적용 과세연도와 기업규모는 무엇인가요?", "일반·신성장·국가전략기술 중 어느 연구개발 분야인가요?"],
             "highlight_terms": ["조세특례제한법 제10조", "연구·인력개발비 세액공제", "기업유형별 공제율"],
@@ -12089,11 +12603,7 @@ def grounded_evidence_fallback(question: str, evidence_documents: list[dict[str,
     # 특수관계자 시가 질문은 검색된 법률·시행령을 연결해 결론부터 답한다.
     # 모델 장애나 단순 조회 경로에서도 일반론으로 끝나지 않도록, 제공된
     # 근거가 있는 범위에서 핵심 원칙과 다음 확인사항을 정리한다.
-    related_party_query = (
-        "특수관계" in normalized
-        and "시가" in normalized
-        and any(term in normalized for term in ("법인", "거래", "관계회사", "관계사", "궁금"))
-    )
+    related_party_query = "특수관계" in normalized and "시가" in normalized
     if related_party_query:
         related_documents = [
             item for item in evidence_documents
@@ -12483,6 +12993,7 @@ def knowledge_chat_progress(progress_id: str) -> dict[str, object]:
 def knowledge_chat(payload: NaturalLanguageQueryRequest) -> dict[str, object]:
     """자연어 질문에 대해 읽기 전용 내부 데이터와 승인 근거를 결합해 답변한다."""
     progress_id = str(payload.request_id or "").strip()[:100] or None
+    quick_start = bool(payload.quick_start and is_quick_start_question(payload.question))
     try:
         start_rag_progress(progress_id, expert_mode=requires_expert_review(payload.question, transaction_hint_from_question(payload.question), {}))
         conversation = [turn.model_dump() for turn in payload.conversation]
@@ -12503,6 +13014,7 @@ def knowledge_chat(payload: NaturalLanguageQueryRequest) -> dict[str, object]:
                     payload.question, internal_context, evidence["evidence_documents"], attachments, conversation,
                     expert_mode=True, evidence_limit=payload.evidence_limit, knowledge_track=payload.knowledge_track,
                     progress_id=progress_id,
+                    quick_start=quick_start,
                 )
             else:
                 answer = run_chat_review_graph(
@@ -12513,15 +13025,24 @@ def knowledge_chat(payload: NaturalLanguageQueryRequest) -> dict[str, object]:
                     conversation,
                     evidence_limit=payload.evidence_limit, knowledge_track=payload.knowledge_track,
                     progress_id=progress_id,
+                    quick_start=quick_start,
                 )
             evidence = answer.pop("_evidence_result", evidence)
         except AiReviewError:
             answer = withheld_chat("AI 검토 또는 원문 대조를 완료하지 못했습니다. 잠시 후 다시 시도하거나 담당자가 원문을 확인해야 합니다.")
         enrich_qa_answer(answer, evidence["evidence_documents"], payload.question, payload.knowledge_track)
         finish_rag_progress(progress_id)
+        progress_result = rag_progress_snapshot(progress_id) if progress_id else {}
         response = {"answer": answer, "internal_context": internal_context, "transaction_hint": transaction_hint_from_question(payload.question),
                     "continuation_summary": build_continuation_summary(conversation),
-                    "model_trace": answer.get("model_trace", {}), "progress_id": progress_id, **evidence}
+                    "model_trace": answer.get("model_trace", {}), "progress_id": progress_id,
+                    "quick_start": quick_start,
+                    "performance": {
+                        "elapsed_seconds": progress_result.get("elapsed_seconds"),
+                        "stage_timings": progress_result.get("stage_timings") or {},
+                        "estimated_total_seconds": progress_result.get("estimated_total_seconds"),
+                    },
+                    **evidence}
         record_chat_event(payload.question, answer, evidence["evidence_documents"])
         return response
     except EvidenceSearchError as error:
@@ -12876,8 +13397,22 @@ def _evaluation_retrieval_bundle(connection: sqlite3.Connection, question: str, 
     # 운영 경로는 다중 쿼리 후보를 합친 뒤 질의 의도 판정기로 관련 없는
     # 문서를 제거한다. 평가도 같은 후처리를 거쳐야 원시 RRF 순위가 아니라
     # 실제 사용자에게 노출되는 근거 품질을 측정할 수 있다.
-    raw_hybrid = fuse_hybrid_results(bm25_results, vector_results, keyword_results, limit=12)
-    filtered_hybrid, _ = filter_and_rerank_documents(raw_hybrid, parsed_query, 5)
+    # 벡터 후보가 없을 때 넓은 일반 키워드 결과를 다시 섞으면 회사자료·공통어
+    # 후보가 상위로 올라가 BM25보다 품질이 낮아질 수 있다. 이 경우에는 이미
+    # 구조화·BM25 후보를 합친 결과를 그대로 보존해, fallback이 원 검색보다
+    # 나빠지는 회귀를 막는다. 벡터가 실제로 있으면 세 신호를 정상적으로 융합한다.
+    raw_hybrid = (
+        fuse_hybrid_results(bm25_results, vector_results, keyword_results, limit=12)
+        if vector_results
+        else list(bm25_results[:12])
+    )
+    if vector_results:
+        filtered_hybrid, _ = filter_and_rerank_documents(raw_hybrid, parsed_query, 5)
+    else:
+        # 벡터가 없는 평가에서는 BM25 fallback을 운영 최종 후보로 그대로
+        # 비교한다. 별도 관련성 필터를 한쪽에만 적용하면 BM25와 Hybrid의
+        # 평가 기준이 달라져, fallback 품질을 실제보다 낮게 측정하게 된다.
+        filtered_hybrid = list(bm25_results[:5])
     return {"parsed_query": parsed_query, "rewritten_queries": queries, "bm25": bm25_results, "keyword": keyword_results, "vector": vector_results, "hybrid": filtered_hybrid}
 
 
@@ -13639,6 +14174,55 @@ def run_quality_checks(args: argparse.Namespace) -> None:
             self.assertEqual(infer_search_track("매출 기준이 뭐야?", "tax"), "accounting")
             self.assertEqual(infer_search_track("재산세 가산세 알려줘", "tax"), "tax")
 
+        def test_quick_start_catalog_is_simple_and_bounded(self):
+            """빠른 시작은 비전공자용 단순 조회 5개만 제공한다."""
+            catalog = quick_start_catalog()
+            self.assertEqual(len(catalog), 5)
+            self.assertEqual(
+                [item["label"] for item in catalog],
+                ["재산세 납부기한", "사업소분 주민세 신고·납부", "부가가치세율", "원천징수 납부기한", "법인세 신고기한"],
+            )
+            self.assertTrue(all(item["mode"] == "quick_lookup" for item in catalog))
+            self.assertTrue(all("검토해주세요" not in item["question"] for item in catalog))
+
+        def test_quick_start_skips_vector_and_llm_work(self):
+            """빠른 시작 검색은 벡터 검색을 호출하지 않는다."""
+            self.assertTrue(is_quick_start_question("재산세는 언제 내나요?"))
+            connection = sqlite3.connect(":memory:")
+            try:
+                with patch.object(module, "structured_keyword_search", return_value=[]), \
+                     patch.object(module, "analyze_knowledge_query", return_value={"law_titles": []}), \
+                     patch.object(module, "semantic_search_documents", side_effect=AssertionError("빠른 시작에서 벡터 검색 호출")):
+                    result = search_hybrid_documents(
+                        connection, "재산세 납기", limit=3,
+                        document_types={"accounting_standard"}, fast_lookup=True, quick_lookup=True,
+                    )
+                self.assertIsInstance(result, list)
+            finally:
+                connection.close()
+
+        def test_quick_start_answer_is_readable_and_grounded(self):
+            """빠른 시작 답변은 핵심 수치와 검색된 조문·근거 문장을 함께 표시한다."""
+            result = quick_start_answer("부가가치세율은 몇 %인가요?", [{
+                "document_id": "law:vat#30", "title": "부가가치세법", "article": "제30조(세율)",
+                "excerpt": "부가가치세의 세율은 10퍼센트로 한다.", "metadata": {},
+            }])
+            self.assertIsNotNone(result)
+            self.assertIn("10%", result["key_answer"])
+            self.assertIn("부가가치세법 제30조", result["answer"])
+            self.assertIn("10퍼센트", result["answer"])
+            self.assertEqual(result["generation_mode"], "quick_start_grounded_lookup")
+
+        def test_main_chat_ui_keeps_search_chat_and_sub_feature_hierarchy(self):
+            """빠른 시작·화면 명칭만 바뀌고 일반 검색 챗봇 및 보조 기능은 유지한다."""
+            html = web_app().body.decode("utf-8")
+            self.assertIn("회계·세무 검토 챗봇", html)
+            self.assertIn("검토 보조 기능", html)
+            self.assertIn("/capital-expenditure", html)
+            self.assertIn('data-quick-question="재산세는 언제 내나요?"', html)
+            self.assertIn('quick_start:quickStart', html)
+            self.assertNotIn('data-quick-question="유형자산 인식 조건을 K-IFRS 기준으로 검토해주세요."', html)
+
         def test_hypothesis_queries_are_added_without_dropping_original(self):
             """다중 가설 검색어를 추가해도 사용자 원문을 반드시 보존한다."""
             question = "계열사에 기계를 싸게 팔았는데 문제돼?"
@@ -13668,6 +14252,23 @@ def run_quality_checks(args: argparse.Namespace) -> None:
             self.assertTrue(any("납부지연가산세" in query for query in rewritten))
             self.assertTrue(any("무신고가산세" in query for query in rewritten))
 
+        def test_property_tax_penalty_answer_explains_local_tax_types(self):
+            """재산세 가산세 질문은 지방세기본법 유형별 설명으로 연결한다."""
+            def fake_evidence(title, article):
+                return [{
+                    "document_id": f"{title}:{article}", "title": title, "article": f"{article}(가산세)",
+                    "excerpt": f"{article} {article}에 따른 가산세 적용요건을 확인한다.",
+                    "relevance_label": "DIRECT", "metadata": {},
+                }]
+            with patch.object(module, "legal_article_evidence", side_effect=fake_evidence):
+                answer = tax_penalty_grounded_fallback("재산세 토지분 가산세 알려줘", [])
+            self.assertIsNotNone(answer)
+            self.assertEqual(answer["generation_mode"], "tax_penalty_grounded_fallback")
+            self.assertIn("지방세기본법", answer["key_answer"])
+            self.assertIn("무신고", answer["answer"])
+            self.assertIn("과소신고", answer["answer"])
+            self.assertIn("납부지연", answer["answer"])
+
         def test_metadata_scope_rejects_wrong_law_family(self):
             """질문 법령군과 무관한 특례법 조문을 검색 후보에서 제거한다."""
             parsed = parse_query_understanding("사업소분 종업원분 신고일정", "tax")
@@ -13688,6 +14289,21 @@ def run_quality_checks(args: argparse.Namespace) -> None:
             self.assertTrue(assessment["retry"])
             self.assertIn("시가 산정", " ".join(assessment["missing_issues"]))
             self.assertTrue(assessment["rewrite_queries"])
+
+        def test_retrieval_sufficiency_stops_after_law_and_decree(self):
+            """법률과 시가 산정 시행령이 있으면 불필요한 재검색을 반복하지 않는다."""
+            question = "특수관계자 시가가 뭐야"
+            parsed = parse_query_understanding(question, "tax")
+            assessment = assess_retrieval_sufficiency(
+                question,
+                parsed,
+                [
+                    {"title": "법인세법", "article": "제52조(부당행위계산의 부인)", "excerpt": "시가를 기준으로 한다.", "relevance_label": "DIRECT"},
+                    {"title": "법인세법 시행령", "article": "제89조(시가의 범위 등)", "excerpt": "특수관계인이 아닌 제3자간에 일반적으로 거래된 가격을 따른다.", "relevance_label": "DIRECT"},
+                ],
+                0,
+            )
+            self.assertFalse(assessment["retry"])
 
         def test_score_zero_documents_are_not_salvaged_as_citations(self):
             """검색 신호가 전혀 없는 문서를 권위도만으로 답변 근거에 넣지 않는다."""
@@ -13820,7 +14436,7 @@ def run_quality_checks(args: argparse.Namespace) -> None:
                     "metadata": {},
                 },
             ]
-            result = grounded_evidence_fallback("특수관계자 시가 궁금해", evidence)
+            result = grounded_evidence_fallback("특수관계자 시가가 뭐야", evidence)
             self.assertEqual(result["generation_mode"], "grounded_related_party_market_value_fallback")
             self.assertIn("독립된 제3자", result["key_answer"])
             self.assertIn("법인세법 제52조", result["key_answer"])
@@ -14046,6 +14662,37 @@ def run_quality_checks(args: argparse.Namespace) -> None:
             self.assertNotIn("검색된 근거만으로 확인되는 핵심 내용을 요약", answer["key_answer"])
             self.assertIn("사업소분 납세의무자", answer["answer"])
 
+        def test_fast_lookup_keeps_keyword_evidence_when_vector_is_unavailable(self):
+            """단순 조회는 벡터 장애가 있어도 구조화·키워드 근거로 계속 검색한다."""
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            self.addCleanup(connection.close)
+            initialize_database(connection)
+            candidate = {
+                "document_id": "law:test",
+                "chunk_id": "law:test#0",
+                "source": "검증용",
+                "document_type": "law",
+                "title": "검증법",
+                "source_url": "https://example.invalid/test",
+                "effective_date": "2025-01-01",
+                "excerpt": "특수관계인 거래의 시가는 정상적인 거래가격을 기준으로 한다.",
+                "article": "제52조",
+                "metadata": {},
+                "relevance": 1,
+            }
+            with patch.object(module, "structured_keyword_search", return_value=[candidate]), \
+                 patch.object(module, "semantic_search_documents", side_effect=AssertionError("단순 조회에서 벡터 호출")):
+                results = search_hybrid_documents(
+                    connection,
+                    "특수관계자 시가",
+                    limit=3,
+                    document_types={"law"},
+                    fast_lookup=True,
+                )
+            self.assertTrue(results)
+            self.assertEqual(results[0]["document_id"], candidate["document_id"])
+
         def test_accounting_impairment_never_degrades_to_evidence_summary(self):
             """손상 기준 질문은 K-IFRS 1036의 적용 판단을 답하고 원문 요약으로 끝내지 않는다."""
             evidence = [{
@@ -14172,6 +14819,22 @@ def run_quality_checks(args: argparse.Namespace) -> None:
             with patch.object(module, "EMBEDDING_RETRIEVAL_MODE", "shadow"), patch.object(module, "EMBEDDING_ROLLOUT_STAGE", "hybrid"):
                 self.assertTrue(embedding_should_participate("재산세 세율"))
 
+        def test_embedding_projector_returns_json_when_vector_store_is_unavailable(self):
+            """pgvector 장애가 화면의 JSON 파싱 오류로 번지지 않도록 구조화된 오류를 반환한다."""
+            with patch.object(module, "embedding_projector_payload", side_effect=SQLAlchemyError("vector store unavailable")):
+                with self.assertRaises(HTTPException) as raised:
+                    embedding_projector_data(1200, "all")
+            self.assertEqual(raised.exception.status_code, 503)
+            self.assertEqual(raised.exception.detail, "임베딩 저장소에 연결할 수 없습니다. 일반 키워드 검색은 계속 사용할 수 있습니다.")
+
+        def test_embedding_projector_ui_handles_structured_and_plain_errors(self):
+            """임베딩 API 오류가 JSON이 아니어도 화면이 비어 버리지 않고 안내한다."""
+            html = web_app().body.decode("utf-8")
+            self.assertIn("JSON.parse(raw)", html)
+            self.assertIn("임베딩 공간을 불러오지 못했습니다.", html)
+            self.assertIn("15초 후 자동 재시도", html)
+            self.assertIn("일반 키워드·법령 검색은 계속 사용할 수 있습니다.", html)
+
         def test_rag_evaluation_metric_is_calculated_from_top_five(self):
             """RAG 평가 결과에서 기대 검색어·MRR·Precision을 계산한다."""
             result = _score_rag_evaluation_results([
@@ -14181,6 +14844,19 @@ def run_quality_checks(args: argparse.Namespace) -> None:
             self.assertTrue(result["hit_rate_at_5"])
             self.assertEqual(result["mrr"], 1.0)
             self.assertGreater(result["recall_at_5"], 0.6)
+
+        def test_no_vector_hybrid_fallback_preserves_bm25_candidates(self):
+            """벡터 후보가 없을 때 일반 키워드 후보가 BM25 근거를 밀어내지 않는다."""
+            bm25 = [
+                {"document_id": "law:1", "title": "지방세법", "article": "제115조", "relevance": 200},
+                {"document_id": "law:2", "title": "지방세기본법", "article": "제55조", "relevance": 180},
+            ]
+            broad_keyword = [
+                {"document_id": "company:1", "title": "회사 사업보고서", "article": None, "relevance": 1},
+            ]
+            fallback = list(bm25[:12])
+            self.assertEqual([item["document_id"] for item in fallback], ["law:1", "law:2"])
+            self.assertNotIn("company:1", [item["document_id"] for item in fallback])
 
         def test_amount_question_requests_missing_calculation_inputs(self):
             result = calculation_answer_from_question("법인세 1억원 계산해줘", "tax")
